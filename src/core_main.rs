@@ -191,6 +191,7 @@ pub fn core_main() -> Option<Vec<String>> {
             crate::platform::try_remove_temp_update_files();
             hbb_common::config::PeerConfig::preload_peers();
         }
+        crate::web_client::start_if_enabled();
         std::thread::spawn(move || crate::start_server(false, no_server));
     } else {
         #[cfg(windows)]

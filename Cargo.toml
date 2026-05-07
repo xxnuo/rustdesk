@@ -66,6 +66,8 @@ clap = "4.2"
 rpassword = "7.2"
 num_cpus = "1.15"
 bytes = { version = "1.4", features = ["serde"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }
 default-net = "0.14"
 wol-rs = "1.0"
 flutter_rust_bridge = { version = "=1.80", features = ["uuid"], optional = true}
