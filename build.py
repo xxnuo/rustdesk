@@ -24,7 +24,9 @@ else:
     flutter_build_dir = 'build/linux/x64/release/bundle/'
 flutter_build_dir_2 = f'flutter/{flutter_build_dir}'
 skip_cargo = False
-flutter_cmd = './.fvm/flutter_sdk/bin/flutter' if os.path.exists('./.fvm/flutter_sdk/bin/flutter') else 'flutter'
+repo_dir = Path(__file__).resolve().parent
+fvm_flutter = repo_dir / '.fvm/flutter_sdk/bin/flutter'
+flutter_cmd = str(fvm_flutter) if fvm_flutter.exists() else 'flutter'
 
 
 def get_deb_arch() -> str:
