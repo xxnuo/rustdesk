@@ -1008,24 +1008,30 @@ pub fn main_set_option(key: String, value: String) {
         );
     }
 
-    // If `is_allow_tls_fallback` and https proxy is used, we need to restart rendezvous mediator.
-    // No need to check if https proxy is used, because this option does not change frequently
-    // and restarting mediator is safe even https proxy is not used.
+    if matches!(
+        key.as_str(),
+        "custom-rendezvous-server"
+            | "relay-server"
+            | "api-server"
+            | "key"
+            | "force-always-relay"
+            | "proxy-url"
+            | "proxy-username"
+            | "proxy-password"
+    ) {
+        set_option(key, "".to_owned());
+        return;
+    }
+
     let is_allow_tls_fallback = key.eq(config::keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK);
     if is_allow_tls_fallback
-        || key.eq("custom-rendezvous-server")
         || key.eq(config::keys::OPTION_ALLOW_WEBSOCKET)
         || key.eq(config::keys::OPTION_DISABLE_UDP)
-        || key.eq("api-server")
     {
         if is_allow_tls_fallback {
             hbb_common::tls::reset_tls_cache();
         }
         set_option(key, value.clone());
-        #[cfg(target_os = "android")]
-        crate::rendezvous_mediator::RendezvousMediator::restart();
-        #[cfg(any(target_os = "android", target_os = "ios", feature = "cli"))]
-        crate::common::test_rendezvous_server();
     } else {
         set_option(key, value.clone());
     }
@@ -1122,18 +1128,15 @@ pub fn main_get_lan_peers() -> String {
 }
 
 pub fn main_get_connect_status() -> String {
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        serde_json::to_string(&get_connect_status()).unwrap_or("".to_string())
-    }
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    {
-        let mut state = hbb_common::config::get_online_state();
-        if state > 0 {
-            state = 1;
-        }
-        serde_json::json!({ "status_num": state }).to_string()
-    }
+    let direct = config::option2bool(
+        config::keys::OPTION_DIRECT_SERVER,
+        &get_option(config::keys::OPTION_DIRECT_SERVER),
+    );
+    let lan = config::option2bool(
+        config::keys::OPTION_ENABLE_LAN_DISCOVERY,
+        &get_option(config::keys::OPTION_ENABLE_LAN_DISCOVERY),
+    );
+    serde_json::json!({ "status_num": if direct || lan { 1 } else { 0 } }).to_string()
 }
 
 pub fn main_check_connect_status() {
@@ -1576,7 +1579,7 @@ pub fn main_get_user_default_option(key: String) -> SyncReturn<String> {
 }
 
 pub fn main_handle_relay_id(id: String) -> String {
-    handle_relay_id(&id).to_owned()
+    id
 }
 
 pub fn main_is_option_fixed(key: String) -> SyncReturn<bool> {

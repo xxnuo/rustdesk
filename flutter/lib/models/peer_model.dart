@@ -21,6 +21,7 @@ class Peer {
   String loginName; //login username
   String device_group_name;
   String note;
+  String connectAddr;
   bool? sameServer;
 
   String getId() {
@@ -45,6 +46,7 @@ class Peer {
         loginName = json['loginName'] ?? '',
         device_group_name = json['device_group_name'] ?? '',
         note = json['note'] is String ? json['note'] : '',
+        connectAddr = json['connect_addr'] ?? json['connectAddr'] ?? '',
         sameServer = json['same_server'];
 
   Map<String, dynamic> toJson() {
@@ -63,6 +65,7 @@ class Peer {
       'loginName': loginName,
       'device_group_name': device_group_name,
       'note': note,
+      'connect_addr': connectAddr,
       'same_server': sameServer,
     };
   }
@@ -75,6 +78,7 @@ class Peer {
       "platform": platform,
       "alias": alias,
       "tags": tags,
+      "connect_addr": connectAddr,
     };
     if (includingHash) {
       res['hash'] = hash;
@@ -90,6 +94,7 @@ class Peer {
       "platform": platform,
       "login_name": loginName,
       "device_group_name": device_group_name,
+      "connect_addr": connectAddr,
     };
   }
 
@@ -108,6 +113,7 @@ class Peer {
     required this.loginName,
     required this.device_group_name,
     required this.note,
+    this.connectAddr = '',
     this.sameServer,
   });
 
@@ -127,6 +133,7 @@ class Peer {
           loginName: '',
           device_group_name: '',
           note: '',
+          connectAddr: '',
         );
   bool equal(Peer other) {
     return id == other.id &&
@@ -142,7 +149,8 @@ class Peer {
         rdpUsername == other.rdpUsername &&
         device_group_name == other.device_group_name &&
         loginName == other.loginName &&
-        note == other.note;
+        note == other.note &&
+        connectAddr == other.connectAddr;
   }
 
   Peer.copy(Peer other)
@@ -161,6 +169,7 @@ class Peer {
             loginName: other.loginName,
             device_group_name: other.device_group_name,
             note: other.note,
+            connectAddr: other.connectAddr,
             sameServer: other.sameServer);
 }
 

@@ -59,6 +59,7 @@ pub(super) fn start_listening() -> ResultType<()> {
                                     hostname,
                                     username: crate::platform::get_active_username(),
                                     platform: whoami::platform().to_string(),
+                                    misc: get_direct_port().to_string(),
                                     ..Default::default()
                                 };
                                 msg_out.set_peer_discovery(peer);
@@ -107,6 +108,24 @@ pub fn send_wol(id: String) {
 #[inline]
 fn get_broadcast_port() -> u16 {
     (RENDEZVOUS_PORT + 3) as _
+}
+
+fn get_direct_port() -> i32 {
+    let port = Config::get_option("direct-access-port")
+        .parse::<i32>()
+        .unwrap_or(0);
+    if port > 0 {
+        port
+    } else {
+        RENDEZVOUS_PORT + 2
+    }
+}
+
+fn connect_addr(ip: &IpAddr, port: i32) -> String {
+    match ip {
+        IpAddr::V4(_) => format!("{ip}:{port}"),
+        IpAddr::V6(_) => format!("[{ip}]:{port}"),
+    }
 }
 
 fn get_mac(_ip: &IpAddr) -> String {
@@ -241,6 +260,8 @@ fn wait_response(
                     Some(rendezvous_message::Union::PeerDiscovery(p)) => {
                         last_recv_time = Instant::now();
                         if p.cmd == "pong" {
+                            let direct_port =
+                                p.misc.parse::<i32>().unwrap_or_else(|_| get_direct_port());
                             let local_mac = if try_get_ip_by_peer {
                                 if let Some(self_addr) = get_ipaddr_by_peer(&addr) {
                                     get_mac(&self_addr)
@@ -268,6 +289,7 @@ fn wait_response(
                                     ip_mac: HashMap::from([
                                         (addr.ip().to_string(), p.mac.clone(),)
                                     ]),
+                                    connect_addr: connect_addr(&addr.ip(), direct_port),
                                     username: p.username.clone(),
                                     hostname: p.hostname.clone(),
                                     platform: p.platform.clone(),

@@ -9,7 +9,6 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/widgets/overlay.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/pages/install_page.dart';
-import 'package:flutter_hbb/desktop/pages/server_page.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_file_transfer_screen.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_view_camera_screen.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_port_forward_screen.dart';
@@ -26,7 +25,7 @@ import 'package:window_manager/window_manager.dart';
 import 'common.dart';
 import 'consts.dart';
 import 'mobile/pages/home_page.dart';
-import 'mobile/pages/server_page.dart';
+import 'mobile/pages/server_page.dart' show androidChannelInit;
 import 'models/platform_model.dart';
 
 import 'package:flutter_hbb/plugin/handlers.dart'
@@ -135,7 +134,6 @@ Future<void> initEnv(String appType) async {
 void runMainApp(bool startService) async {
   // register uni links
   await initEnv(kAppTypeMain);
-  checkUpdate();
   // trigger connection status updater
   await bind.mainCheckConnectStatus();
   if (startService) {
@@ -143,8 +141,6 @@ void runMainApp(bool startService) async {
     bind.pluginSyncUi(syncTo: kAppTypeMain);
     bind.pluginListReload();
   }
-  await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
-  gFFI.userModel.refreshCurrentUser();
   runApp(App());
 
   bool? alwaysOnTop;
@@ -179,12 +175,9 @@ void runMainApp(bool startService) async {
 
 void runMobileApp() async {
   await initEnv(kAppTypeMain);
-  checkUpdate();
   if (isAndroid) androidChannelInit();
   if (isAndroid) platformFFI.syncAndroidServiceAppDirConfigPath();
   draggablePositions.load();
-  await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
-  gFFI.userModel.refreshCurrentUser();
   runApp(App());
   await initUniLinks();
 }
@@ -290,7 +283,7 @@ void runConnectionManagerScreen() async {
   await initEnv(kAppTypeConnectionManager);
   _runApp(
     '',
-    const DesktopServerPage(),
+    App(),
     MyTheme.currentThemeMode(),
   );
   final hide = await bind.cmGetConfig(name: "hide_cm") == 'true';

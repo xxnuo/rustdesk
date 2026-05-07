@@ -58,22 +58,13 @@ impl RendezvousMediator {
     }
 
     pub async fn start_all() {
-        crate::test_nat_type();
         if config::is_outgoing_only() {
             loop {
                 sleep(1.).await;
             }
         }
-        crate::hbbs_http::sync::start();
-        #[cfg(target_os = "windows")]
-        if crate::platform::is_installed() && crate::is_server() {
-            crate::updater::start_auto_update();
-        }
         check_zombie();
         let server = new_server();
-        if config::option2bool("stop-service", &Config::get_option("stop-service")) {
-            crate::test_rendezvous_server();
-        }
         let server_cloned = server.clone();
         tokio::spawn(async move {
             direct_server(server_cloned).await;
@@ -94,50 +85,13 @@ impl RendezvousMediator {
         }
         scrap::codec::test_av1();
         loop {
-            let timeout = Arc::new(RwLock::new(CONNECT_TIMEOUT));
-            let conn_start_time = Instant::now();
-            *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
-            if !config::option2bool("stop-service", &Config::get_option("stop-service"))
-                && !crate::platform::installing_service()
+            if config::option2bool("stop-service", &Config::get_option("stop-service"))
+                || crate::platform::installing_service()
             {
-                let mut futs = Vec::new();
-                let servers = Config::get_rendezvous_servers();
-                SHOULD_EXIT.store(false, Ordering::SeqCst);
-                MANUAL_RESTARTED.store(false, Ordering::SeqCst);
-                for host in servers.clone() {
-                    let server = server.clone();
-                    let timeout = timeout.clone();
-                    futs.push(tokio::spawn(async move {
-                        if let Err(err) = Self::start(server, host).await {
-                            let err = format!("rendezvous mediator error: {err}");
-                            // When user reboot, there might be below error, waiting too long
-                            // (CONNECT_TIMEOUT 18s) will make user think there is bug
-                            if err.contains("10054") || err.contains("11001") {
-                                // No such host is known. (os error 11001)
-                                // An existing connection was forcibly closed by the remote host. (os error 10054): also happens for UDP
-                                *timeout.write().unwrap() = 3000;
-                            }
-                            log::error!("{err}");
-                        }
-                        // SHOULD_EXIT here is to ensure once one exits, the others also exit.
-                        SHOULD_EXIT.store(true, Ordering::SeqCst);
-                    }));
-                }
-                join_all(futs).await;
-            } else {
                 server.write().unwrap().close_connections();
             }
             Config::reset_online();
-            let timeout = *timeout.read().unwrap();
-            if !MANUAL_RESTARTED.load(Ordering::SeqCst) {
-                let elapsed = conn_start_time.elapsed().as_millis() as u64;
-                if elapsed < timeout {
-                    sleep(((timeout - elapsed) / 1000) as _).await;
-                }
-            } else {
-                // https://github.com/rustdesk/rustdesk/issues/12233
-                sleep(0.033).await;
-            }
+            sleep(1.).await;
         }
     }
 

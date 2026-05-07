@@ -408,7 +408,23 @@ pub fn get_sound_inputs() -> Vec<String> {
 }
 
 #[inline]
-pub fn set_options(m: HashMap<String, String>) {
+fn is_local_only_ignored_option(key: &str) -> bool {
+    matches!(
+        key,
+        "custom-rendezvous-server"
+            | "relay-server"
+            | "api-server"
+            | "key"
+            | "force-always-relay"
+            | "proxy-url"
+            | "proxy-username"
+            | "proxy-password"
+    )
+}
+
+#[inline]
+pub fn set_options(mut m: HashMap<String, String>) {
+    m.retain(|key, _| !is_local_only_ignored_option(key));
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         *OPTIONS.lock().unwrap() = m.clone();
@@ -420,6 +436,10 @@ pub fn set_options(m: HashMap<String, String>) {
 
 #[inline]
 pub fn set_option(key: String, value: String) {
+    if is_local_only_ignored_option(&key) {
+        Config::set_option(key, "".to_owned());
+        return;
+    }
     if &key == "stop-service" {
         #[cfg(target_os = "macos")]
         {
@@ -813,11 +833,21 @@ pub fn get_lan_peers() -> Vec<HashMap<&'static str, String>> {
         .peers
         .iter()
         .map(|peer| {
+            let connect_addr = if peer.connect_addr.is_empty() {
+                peer.ip_mac
+                    .keys()
+                    .next()
+                    .map(|ip| crate::check_port(ip, config::RENDEZVOUS_PORT + 2))
+                    .unwrap_or_default()
+            } else {
+                peer.connect_addr.clone()
+            };
             HashMap::<&str, String>::from_iter([
                 ("id", peer.id.clone()),
                 ("username", peer.username.clone()),
                 ("hostname", peer.hostname.clone()),
                 ("platform", peer.platform.clone()),
+                ("connect_addr", connect_addr),
             ])
         })
         .collect()
@@ -1490,13 +1520,8 @@ async fn check_id(
     ""
 }
 
-// if it's relay id, return id processed, otherwise return original id
 pub fn handle_relay_id(id: &str) -> &str {
-    if id.ends_with(r"\r") || id.ends_with(r"/r") {
-        &id[0..id.len() - 2]
-    } else {
-        id
-    }
+    id
 }
 
 pub fn support_remove_wallpaper() -> bool {

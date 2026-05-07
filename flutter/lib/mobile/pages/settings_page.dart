@@ -4,7 +4,6 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
-import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 import 'package:settings_ui/settings_ui.dart';
@@ -13,11 +12,9 @@ import 'package:url_launcher/url_launcher_string.dart';
 
 import '../../common.dart';
 import '../../common/widgets/dialog.dart';
-import '../../common/widgets/login.dart';
 import '../../consts.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
-import '../widgets/dialog.dart';
 import 'home_page.dart';
 import 'scan_page.dart';
 
@@ -70,7 +67,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
       false; //androidVersion >= 26; // remove because not work on every device
   var _ignoreBatteryOpt = false;
   var _enableStartOnBoot = false;
-  var _checkUpdateOnStartup = false;
   var _showTerminalExtraKeys = false;
   var _floatingWindowDisabled = false;
   var _keepScreenOn = KeepScreenOn.duringControlled; // relay on floating window
@@ -89,17 +85,9 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   var _fingerprint = "";
   var _buildDate = "";
   var _autoDisconnectTimeout = "";
-  var _hideServer = false;
-  var _hideProxy = false;
   var _hideNetwork = false;
   var _hideWebSocket = false;
   var _enableTrustedDevices = false;
-  var _enableUdpPunch = false;
-  var _allowInsecureTlsFallback = false;
-  var _disableUdp = false;
-  var _enableIpv6Punch = false;
-  var _isUsingPublicServer = false;
-  var _allowAskForNoteAtEndOfConnection = false;
   var _preventSleepWhileConnected = true;
 
   _SettingsState() {
@@ -115,9 +103,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     _enableHardwareCodec = option2bool(kOptionEnableHwcodec,
         bind.mainGetOptionSync(key: kOptionEnableHwcodec));
     _allowWebSocket = mainGetBoolOptionSync(kOptionAllowWebSocket);
-    _allowInsecureTlsFallback =
-        mainGetBoolOptionSync(kOptionAllowInsecureTLSFallback);
-    _disableUdp = bind.mainGetOptionSync(key: kOptionDisableUdp) == 'Y';
     _autoRecordIncomingSession = option2bool(kOptionAllowAutoRecordIncoming,
         bind.mainGetOptionSync(key: kOptionAllowAutoRecordIncoming));
     _autoRecordOutgoingSession = option2bool(kOptionAllowAutoRecordOutgoing,
@@ -128,19 +113,12 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         bind.mainGetOptionSync(key: kOptionAllowAutoDisconnect));
     _autoDisconnectTimeout =
         bind.mainGetOptionSync(key: kOptionAutoDisconnectTimeout);
-    _hideServer =
-        bind.mainGetBuildinOption(key: kOptionHideServerSetting) == 'Y';
-    _hideProxy = bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
     _hideNetwork =
         bind.mainGetBuildinOption(key: kOptionHideNetworkSetting) == 'Y';
     _hideWebSocket =
         bind.mainGetBuildinOption(key: kOptionHideWebSocketSetting) == 'Y' ||
             isWeb;
     _enableTrustedDevices = mainGetBoolOptionSync(kOptionEnableTrustedDevices);
-    _enableUdpPunch = mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
-    _enableIpv6Punch = mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);
-    _allowAskForNoteAtEndOfConnection =
-        mainGetLocalBoolOptionSync(kOptionAllowAskForNoteAtEndOfConnection);
     _preventSleepWhileConnected =
         mainGetLocalBoolOptionSync(kOptionKeepAwakeDuringOutgoingSessions);
     _showTerminalExtraKeys =
@@ -180,13 +158,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         _enableStartOnBoot = enableStartOnBoot;
       }
 
-      var checkUpdateOnStartup =
-          mainGetLocalBoolOptionSync(kOptionEnableCheckUpdate);
-      if (checkUpdateOnStartup != _checkUpdateOnStartup) {
-        update = true;
-        _checkUpdateOnStartup = checkUpdateOnStartup;
-      }
-
       var floatingWindowDisabled =
           bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) == "Y" ||
               !await AndroidPermissionManager.check(kSystemAlertWindow);
@@ -214,12 +185,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
       if (_buildDate != buildDate) {
         update = true;
         _buildDate = buildDate;
-      }
-
-      final isUsingPublicServer = await bind.mainIsUsingPublicServer();
-      if (_isUsingPublicServer != isUsingPublicServer) {
-        update = true;
-        _isUsingPublicServer = isUsingPublicServer;
       }
 
       if (update) {
@@ -592,22 +557,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           gFFI.invokeMethod(AndroidChannel.kSetStartOnBootOpt, toValue);
         }));
 
-    if (!bind.isCustomClient()) {
-      enhancementsTiles.add(
-        SettingsTile.switchTile(
-          initialValue: _checkUpdateOnStartup,
-          title:
-              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(translate('Check for software update on startup')),
-          ]),
-          onToggle: (bool toValue) async {
-            await mainSetLocalBoolOption(kOptionEnableCheckUpdate, toValue);
-            setState(() => _checkUpdateOnStartup = toValue);
-          },
-        ),
-      );
-    }
-
     enhancementsTiles.add(
       SettingsTile.switchTile(
         initialValue: _showTerminalExtraKeys,
@@ -681,53 +630,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     final settings = SettingsList(
       sections: [
         customClientSection,
-        if (!bind.isDisableAccount())
-          SettingsSection(
-            title: Text(translate('Account')),
-            tiles: [
-              SettingsTile(
-                title: Obx(() => Text(gFFI.userModel.userName.value.isEmpty
-                    ? translate('Login')
-                    : '${translate('Logout')} (${gFFI.userModel.accountLabelWithHandle})')),
-                leading: Obx(() {
-                  final avatar = bind.mainResolveAvatarUrl(
-                      avatar: gFFI.userModel.avatar.value);
-                  return buildAvatarWidget(
-                        avatar: avatar,
-                        size: 28,
-                        borderRadius: null,
-                        fallback: Icon(Icons.person),
-                      ) ??
-                      Icon(Icons.person);
-                }),
-                onPressed: (context) {
-                  if (gFFI.userModel.userName.value.isEmpty) {
-                    loginDialog();
-                  } else {
-                    logOutConfirmDialog();
-                  }
-                },
-              ),
-            ],
-          ),
         SettingsSection(title: Text(translate("Settings")), tiles: [
-          if (!disabledSettings && !_hideNetwork && !_hideServer)
-            SettingsTile(
-                title: Text(translate('ID/Relay Server')),
-                leading: Icon(Icons.cloud),
-                onPressed: (context) {
-                  showServerSettings(gFFI.dialogManager, (callback) async {
-                    _isUsingPublicServer = await bind.mainIsUsingPublicServer();
-                    setState(callback);
-                  });
-                }),
-          if (!_hideNetwork && !_hideProxy)
-            SettingsTile(
-                title: Text(translate('Socks5/Http(s) Proxy')),
-                leading: Icon(Icons.network_ping),
-                onPressed: (context) {
-                  changeSocks5Proxy();
-                }),
           if (!disabledSettings && !_hideNetwork && !_hideWebSocket)
             SettingsTile.switchTile(
               title: Text(translate('Use WebSocket')),
@@ -742,64 +645,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                         _allowWebSocket = newValue;
                       });
                     },
-            ),
-          if (!_isUsingPublicServer)
-            SettingsTile.switchTile(
-              title: Text(translate('Allow insecure TLS fallback')),
-              initialValue: _allowInsecureTlsFallback,
-              onToggle: isOptionFixed(kOptionAllowInsecureTLSFallback)
-                  ? null
-                  : (v) async {
-                      await mainSetBoolOption(
-                          kOptionAllowInsecureTLSFallback, v);
-                      final newValue = mainGetBoolOptionSync(
-                          kOptionAllowInsecureTLSFallback);
-                      setState(() {
-                        _allowInsecureTlsFallback = newValue;
-                      });
-                    },
-            ),
-          if (isAndroid && !outgoingOnly && !_isUsingPublicServer)
-            SettingsTile.switchTile(
-              title: Text(translate('Disable UDP')),
-              initialValue: _disableUdp,
-              onToggle: isOptionFixed(kOptionDisableUdp)
-                  ? null
-                  : (v) async {
-                      await bind.mainSetOption(
-                          key: kOptionDisableUdp, value: v ? 'Y' : 'N');
-                      final newValue =
-                          bind.mainGetOptionSync(key: kOptionDisableUdp) == 'Y';
-                      setState(() {
-                        _disableUdp = newValue;
-                      });
-                    },
-            ),
-          if (!incomingOnly)
-            SettingsTile.switchTile(
-              title: Text(translate('Enable UDP hole punching')),
-              initialValue: _enableUdpPunch,
-              onToggle: (v) async {
-                await mainSetLocalBoolOption(kOptionEnableUdpPunch, v);
-                final newValue =
-                    mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
-                setState(() {
-                  _enableUdpPunch = newValue;
-                });
-              },
-            ),
-          if (!incomingOnly)
-            SettingsTile.switchTile(
-              title: Text(translate('Enable IPv6 P2P connection')),
-              initialValue: _enableIpv6Punch,
-              onToggle: (v) async {
-                await mainSetLocalBoolOption(kOptionEnableIpv6Punch, v);
-                final newValue =
-                    mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);
-                setState(() {
-                  _enableIpv6Punch = newValue;
-                });
-              },
             ),
           SettingsTile(
               title: Text(translate('Language')),
@@ -819,24 +664,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
               showThemeSettings(gFFI.dialogManager);
             },
           ),
-          if (!bind.isDisableAccount())
-            SettingsTile.switchTile(
-              title: Text(translate('note-at-conn-end-tip')),
-              initialValue: _allowAskForNoteAtEndOfConnection,
-              onToggle: (v) async {
-                if (v && !gFFI.userModel.isLogin) {
-                  final res = await loginDialog();
-                  if (res != true) return;
-                }
-                await mainSetLocalBoolOption(
-                    kOptionAllowAskForNoteAtEndOfConnection, v);
-                final newValue = mainGetLocalBoolOptionSync(
-                    kOptionAllowAskForNoteAtEndOfConnection);
-                setState(() {
-                  _allowAskForNoteAtEndOfConnection = newValue;
-                });
-              },
-            ),
           if (!incomingOnly)
             SettingsTile.switchTile(
               title:

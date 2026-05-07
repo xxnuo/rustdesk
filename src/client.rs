@@ -121,11 +121,9 @@ pub const LOGIN_SCREEN_WAYLAND: &str = "Wayland login screen is not supported";
 #[cfg(target_os = "linux")]
 pub const SCRAP_UBUNTU_HIGHER_REQUIRED: &str = "ubuntu-21-04-required";
 #[cfg(target_os = "linux")]
-pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str =
-    "wayland-requires-higher-linux-version";
+pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str = "wayland-requires-higher-linux-version";
 #[cfg(target_os = "linux")]
-pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str =
-    "xdp-portal-unavailable";
+pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str = "xdp-portal-unavailable";
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 
@@ -282,6 +280,7 @@ impl Client {
                 false,
             ));
         }
+        bail!("Only LAN discovery or direct IP access is supported");
 
         let other_server = interface.get_lch().read().unwrap().other_server.clone();
         let (peer, other_server, key, token) = if let Some((a, b, c)) = other_server.as_ref() {
@@ -1780,7 +1779,7 @@ impl LoginConfigHandler {
         id: String,
         conn_type: ConnType,
         switch_uuid: Option<String>,
-        mut force_relay: bool,
+        _force_relay: bool,
         adapter_luid: Option<i64>,
         shared_password: Option<String>,
         conn_token: Option<String>,
@@ -1807,19 +1806,12 @@ impl LoginConfigHandler {
                 key.to_owned()
             };
 
-            // here we can check <id>/r@server
             let real_id = crate::ui_interface::handle_relay_id(raw_id).to_string();
-            if real_id != raw_id {
-                force_relay = true;
-            }
             self.other_server = Some((real_id.clone(), server.to_owned(), key));
             id = format!("{real_id}@{server}");
         } else {
             let real_id = crate::ui_interface::handle_relay_id(&id);
-            if real_id != id {
-                force_relay = true;
-                id = real_id.to_owned();
-            }
+            id = real_id.to_owned();
         }
 
         self.id = id;
@@ -1847,11 +1839,7 @@ impl LoginConfigHandler {
         self.session_id = sid;
         self.supported_encoding = Default::default();
         self.restarting_remote_device = false;
-        self.force_relay =
-            config::option2bool("force-always-relay", &self.get_option("force-always-relay"))
-                || force_relay
-                || use_ws()
-                || Config::is_proxy();
+        self.force_relay = false;
         if let Some((real_id, server, key)) = &self.other_server {
             let other_server_key = self.get_option("other-server-key");
             if !other_server_key.is_empty() && key.is_empty() {
@@ -2546,11 +2534,6 @@ impl LoginConfigHandler {
                     .insert("other-server-key".to_owned(), c.clone());
             }
         }
-        if self.force_relay {
-            config
-                .options
-                .insert("force-always-relay".to_owned(), "Y".to_owned());
-        }
         #[cfg(feature = "flutter")]
         {
             // sync connected password to personal ab automatically if it is not shared password
@@ -2630,16 +2613,15 @@ impl LoginConfigHandler {
         };
         let mut avatar = get_builtin_option(keys::OPTION_AVATAR);
         if avatar.is_empty() {
-            avatar = serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option(
-                "user_info",
-            ))
-            .ok()
-            .and_then(|x| {
-                x.get("avatar")
-                    .and_then(|x| x.as_str())
-                    .map(|x| x.trim().to_owned())
-            })
-            .unwrap_or_default();
+            avatar =
+                serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option("user_info"))
+                    .ok()
+                    .and_then(|x| {
+                        x.get("avatar")
+                            .and_then(|x| x.as_str())
+                            .map(|x| x.trim().to_owned())
+                    })
+                    .unwrap_or_default();
         }
         avatar = resolve_avatar_url(avatar);
         let mut display_name = get_builtin_option(keys::OPTION_DISPLAY_NAME);

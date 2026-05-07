@@ -12,7 +12,6 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
-import 'package:flutter_hbb/mobile/widgets/dialog.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/printer_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
@@ -76,7 +75,6 @@ class DesktopSettingPage extends StatefulWidget {
     if (!bind.isIncomingOnly()) SettingsTabKey.display,
     if (!isWeb && !bind.isIncomingOnly() && bind.pluginFeatureIsEnabled())
       SettingsTabKey.plugin,
-    if (!bind.isDisableAccount()) SettingsTabKey.account,
     if (isWindows &&
         bind.mainGetBuildinOption(key: kOptionHideRemotePrinterSetting) != 'Y')
       SettingsTabKey.printer,
@@ -482,7 +480,6 @@ class _GeneralState extends State<_General> {
   }
 
   Widget other() {
-    final showAutoUpdate = isWindows && bind.mainIsInstalled();
     final children = <Widget>[
       if (!isWeb && !bind.isIncomingOnly())
         _OptionCheckBox(context, 'Confirm before closing multiple tabs',
@@ -529,40 +526,12 @@ class _GeneralState extends State<_General> {
               isServer: false,
             ),
           ),
-        if (!isWeb && !bind.isCustomClient())
-          _OptionCheckBox(
-            context,
-            'Check for software update on startup',
-            kOptionEnableCheckUpdate,
-            isServer: false,
-          ),
-        if (showAutoUpdate)
-          _OptionCheckBox(
-            context,
-            'Auto update',
-            kOptionAllowAutoUpdate,
-            isServer: true,
-          ),
         if (isWindows && !bind.isOutgoingOnly())
           _OptionCheckBox(
             context,
             'Capture screen using DirectX',
             kOptionDirectxCapture,
           ),
-        if (!bind.isIncomingOnly()) ...[
-          _OptionCheckBox(
-            context,
-            'Enable UDP hole punching',
-            kOptionEnableUdpPunch,
-            isServer: false,
-          ),
-          _OptionCheckBox(
-            context,
-            'Enable IPv6 P2P connection',
-            kOptionEnableIpv6Punch,
-            isServer: false,
-          ),
-        ],
       ],
     ];
 
@@ -579,21 +548,6 @@ class _GeneralState extends State<_General> {
     if (!isWeb && bind.mainShowOption(key: kOptionAllowLinuxHeadless)) {
       children.add(_OptionCheckBox(
           context, 'Allow linux headless', kOptionAllowLinuxHeadless));
-    }
-    if (!bind.isDisableAccount()) {
-      children.add(_OptionCheckBox(
-        context,
-        'note-at-conn-end-tip',
-        kOptionAllowAskForNoteAtEndOfConnection,
-        isServer: false,
-        optSetter: (key, value) async {
-          if (value && !gFFI.userModel.isLogin) {
-            final res = await loginDialog();
-            if (res != true) return;
-          }
-          await mainSetLocalBoolOption(key, value);
-        },
-      ));
     }
     return _Card(title: 'Other', children: children);
   }
@@ -758,7 +712,7 @@ class _GeneralState extends State<_General> {
                                 initialDirectory = user_dir;
                               }
                               String? selectedDirectory =
-                                  await FilePicker.platform.getDirectoryPath(
+                                  await FilePicker.getDirectoryPath(
                                       initialDirectory: initialDirectory);
                               if (selectedDirectory != null) {
                                 await bind.mainSetLocalOption(
@@ -1566,14 +1520,10 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
   }
 
   Widget network(BuildContext context) {
-    final hideServer =
-        bind.mainGetBuildinOption(key: kOptionHideServerSetting) == 'Y';
-    final hideProxy =
-        isWeb || bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
     final hideWebSocket = isWeb ||
         bind.mainGetBuildinOption(key: kOptionHideWebSocketSetting) == 'Y';
 
-    if (hideServer && hideProxy && hideWebSocket) {
+    if (hideWebSocket) {
       return Offstage();
     }
 
@@ -1651,9 +1601,6 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
           ),
         );
 
-    final outgoingOnly = bind.isOutgoingOnly();
-
-    final divider = const Divider(height: 1, indent: 16, endIndent: 16);
     return _Card(
       title: 'Network',
       children: [
@@ -1661,70 +1608,12 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (!hideServer)
-                listTile(
-                  icon: Icons.dns_outlined,
-                  title: 'ID/Relay Server',
-                  onTap: () => showServerSettings(gFFI.dialogManager, setState),
-                ),
-              if (!hideProxy && !hideServer) divider,
-              if (!hideProxy)
-                listTile(
-                  icon: Icons.network_ping_outlined,
-                  title: 'Socks5/Http(s) Proxy',
-                  onTap: changeSocks5Proxy,
-                ),
-              if (!hideWebSocket && (!hideServer || !hideProxy)) divider,
               if (!hideWebSocket)
                 switchWidget(
                     Icons.web_asset_outlined,
                     'Use WebSocket',
                     '${translate('websocket_tip')}\n\n${translate('server-oss-not-support-tip')}',
                     kOptionAllowWebSocket),
-              if (!isWeb)
-                futureBuilder(
-                  future: bind.mainIsUsingPublicServer(),
-                  hasData: (isUsingPublicServer) {
-                    if (isUsingPublicServer) {
-                      return Offstage();
-                    } else {
-                      return Column(
-                        children: [
-                          if (!hideServer || !hideProxy || !hideWebSocket)
-                            divider,
-                          switchWidget(
-                              Icons.no_encryption_outlined,
-                              'Allow insecure TLS fallback',
-                              'allow-insecure-tls-fallback-tip',
-                              kOptionAllowInsecureTLSFallback),
-                          if (!outgoingOnly) divider,
-                          if (!outgoingOnly)
-                            listTile(
-                              icon: Icons.lan_outlined,
-                              title: 'Disable UDP',
-                              showTooltip: true,
-                              tooltipMessage:
-                                  '${translate('disable-udp-tip')}\n\n${translate('server-oss-not-support-tip')}',
-                              trailing: Switch(
-                                value: bind.mainGetOptionSync(
-                                        key: kOptionDisableUdp) ==
-                                    'Y',
-                                onChanged:
-                                    locked || isOptionFixed(kOptionDisableUdp)
-                                        ? null
-                                        : (value) async {
-                                            await bind.mainSetOption(
-                                                key: kOptionDisableUdp,
-                                                value: value ? 'Y' : 'N');
-                                            setState(() {});
-                                          },
-                              ),
-                            ),
-                        ],
-                      );
-                    }
-                  },
-                ),
             ],
           ),
         ),

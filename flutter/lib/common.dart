@@ -1,7 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
-
 import 'package:back_button_interceptor/back_button_interceptor.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/foundation.dart';
@@ -1571,11 +1569,12 @@ String translate(String name) {
 // sciter: Does not have the function, but it should be kept the same.
 bool option2bool(String option, String value) {
   bool res;
-  if (option.startsWith("enable-")) {
+  if (option == kOptionDirectServer) {
+    res = value != "N";
+  } else if (option.startsWith("enable-")) {
     res = value != "N";
   } else if (option.startsWith("allow-") ||
       option == kOptionStopService ||
-      option == kOptionDirectServer ||
       option == kOptionForceAlwaysRelay) {
     res = value == "Y";
   } else {
@@ -2548,9 +2547,6 @@ connect(BuildContext context, String id,
     } catch (_) {}
   }
   id = id.replaceAll(' ', '');
-  final oldId = id;
-  id = await bind.mainHandleRelayId(id: id);
-  forceRelay = id != oldId || forceRelay;
   assert(!(isFileTransfer && isTcpTunneling && isRDP),
       "more than one connect type");
 
@@ -4179,8 +4175,7 @@ Widget? buildAvatarWidget({
       width: size,
       height: size,
       fit: BoxFit.cover,
-      errorBuilder: (_, __, ___) =>
-          fallback ?? SizedBox.shrink(),
+      errorBuilder: (_, __, ___) => fallback ?? SizedBox.shrink(),
     ),
   );
 }
