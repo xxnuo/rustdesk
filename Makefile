@@ -4,4 +4,4 @@ dev:
 	cd flutter && ./run.sh
 
 build:
-	python3 build.py --flutter --hwcodec
+	uv run python build.py --flutter --hwcodec
