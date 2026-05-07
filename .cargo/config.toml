@@ -14,3 +14,6 @@ rustflags = [
 #]
 [net]
 git-fetch-with-cli = true
+
+[env]
+LIBCLANG_PATH = "/usr/lib/llvm21/lib"

@@ -212,6 +212,9 @@ exclude = ["vdi/host", "examples/custom_plugin"]
 [patch.crates-io]
 libxdo-sys = { path = "libs/libxdo-sys-stub" }
 
+[patch."https://github.com/rustdesk-org/rust-webm"]
+webm = { path = "thirdparty/rust-webm" }
+
 [package.metadata.winres]
 LegalCopyright = "Copyright © 2025 Purslane Ltd. All rights reserved."
 ProductName = "RustDesk"
