@@ -1,3 +1,6 @@
 [submodule "libs/hbb_common"]
 	path = libs/hbb_common
 	url = https://github.com/rustdesk/hbb_common
+[submodule "thirdparty/rust-webm"]
+	path = thirdparty/rust-webm
+	url = https://github.com/xxnuo/rust-webm.git
