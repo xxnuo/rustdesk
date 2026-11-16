@@ -1,0 +1,13 @@
+[package]
+name = "gdesk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+
+[dependencies]
+bytemuck = { version = "1.23", features = ["derive"] }
+xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
+lz4_flex = "0.11"
+wgpu = "24"
+pollster = "0.4"
+log = "0.4"
