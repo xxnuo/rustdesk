@@ -5,6 +5,7 @@ message EncodedVideoFrame {
   bytes data = 1;
   bool key = 2;
   int64 pts = 3;
+  bool gdesk_datagram = 4;
 }
 
 message EncodedVideoFrames { repeated EncodedVideoFrame frames = 1; }
@@ -122,6 +123,7 @@ message SupportedEncoding {
   bool av1 = 4;
   CodecAbility i444 = 5;
   bool gdesk = 9;
+  bool gdesk_input_redundancy = 10;
 }
 
 message PeerInfo {
@@ -139,6 +141,7 @@ message PeerInfo {
   // NOTE: Only support one-level dictionaries (for peer to update), and the key is of type string.
   string platform_additions = 12;
   WindowsSessions windows_sessions = 13;
+  uint32 gdesk_session_lease_id = 14;
 }
 
 message WindowsSession {  
@@ -679,6 +682,8 @@ message SupportedDecoding {
   CodecAbility i444 = 7;
   Chroma prefer_chroma = 8;
   int32 ability_gdesk = 9;
+  bool gdesk_input_redundancy = 10;
+  bool gdesk_datagrams = 11;
 }
 
 message OptionMessage {
@@ -881,6 +886,7 @@ message Misc {
     // by id again, so the shape just selected is always there to give.
     uint64 request_cursor_data = 39;
     GDeskAck gdesk_ack = 40;
+    bytes gdesk_input_packet = 41;
   }
 }
 
@@ -892,6 +898,7 @@ message GDeskAck {
   bytes tile_ack_bitmap = 5;
   uint32 modifier_bitmap = 6;
   uint64 input_lease_id = 7;
+  uint32 display = 8;
 }
 
 message VoiceCallRequest {

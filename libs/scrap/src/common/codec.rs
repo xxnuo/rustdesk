@@ -102,6 +102,16 @@ pub trait EncoderApi {
     }
 
     #[cfg(feature = "gdesk")]
+    fn apply_gdesk_tile_ack(&mut self, _acked_frame_seq: u32, _bitmap: &[u8]) -> ResultType<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "gdesk")]
+    fn enable_gdesk_datagrams(&mut self, _enabled: bool) -> ResultType<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "gdesk")]
     fn is_gdesk(&self) -> bool {
         false
     }
@@ -142,7 +152,7 @@ pub struct Decoder {
     #[cfg(feature = "mediacodec")]
     h265_media_codec: MediaCodecDecoder,
     #[cfg(feature = "gdesk")]
-    gdesk: Option<gdesk::GDeskDecoder>,
+    pub(super) gdesk: Option<gdesk::GDeskDecoder>,
     format: CodecFormat,
     valid: bool,
     #[cfg(feature = "hwcodec")]
@@ -158,6 +168,12 @@ pub enum EncodingUpdate {
 }
 
 impl Encoder {
+    #[cfg(feature = "gdesk")]
+    pub fn gdesk_datagrams_supported() -> bool {
+        let peers = PEER_DECODINGS.lock().unwrap();
+        peers.len() == 1 && peers.values().all(|peer| peer.gdesk_datagrams)
+    }
+
     pub fn new(config: EncoderCfg, i444: bool) -> ResultType<Encoder> {
         log::info!("new encoder: {config:?}, i444: {i444}");
         match config {
@@ -402,6 +418,7 @@ impl Encoder {
         #[cfg(feature = "gdesk")]
         {
             encoding.gdesk = true;
+            encoding.gdesk_input_redundancy = true;
         }
         #[cfg(feature = "hwcodec")]
         if enable_hwcodec_option() {
@@ -513,6 +530,8 @@ impl Decoder {
         #[cfg(feature = "gdesk")]
         {
             decoding.ability_gdesk = 1;
+            decoding.gdesk_input_redundancy = true;
+            decoding.gdesk_datagrams = true;
         }
         #[cfg(feature = "hwcodec")]
         {

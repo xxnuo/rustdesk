@@ -285,6 +285,8 @@ impl UserData {
 
 #[derive(Default, Debug, Clone)]
 struct DisplayData {
+    #[cfg(feature = "gdesk")]
+    gdesk_tile_acks: HashMap<i32, VecDeque<gdesk::GDeskAck>>,
     send_counter: usize, // Number of times encode during period
     support_changing_quality: bool,
 }
@@ -401,6 +403,39 @@ impl VideoQoS {
         }
     }
 
+    pub fn queue_gdesk_tile_ack(&mut self, id: i32, display: u32, ack: gdesk::GDeskAck) {
+        if ack.tile_ack_bitmap.is_empty() || !self.users.contains_key(&id) {
+            return;
+        }
+        if let Some(display) = self.displays.get_mut(&format!("monitor{display}")) {
+            let pending = display.gdesk_tile_acks.entry(id).or_default();
+            if pending.len() == 32 {
+                pending.pop_front();
+            }
+            pending.push_back(ack);
+        }
+    }
+
+    pub fn take_gdesk_tile_acks(
+        &mut self,
+        video_service_name: &str,
+    ) -> Vec<(i32, gdesk::GDeskAck)> {
+        let single_viewer = self.users.len() == 1;
+        self.displays
+            .get_mut(video_service_name)
+            .map(|display| {
+                let queued = std::mem::take(&mut display.gdesk_tile_acks);
+                if !single_viewer {
+                    return Vec::new();
+                }
+                queued
+                    .into_iter()
+                    .flat_map(|(id, acks)| acks.into_iter().map(move |ack| (id, ack)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn user_gdesk_send_backlog(&mut self, id: i32, backlogged: bool) {
         let now = self.now();
         if let Some(user) = self.users.get_mut(&id) {
@@ -442,6 +477,10 @@ impl VideoQoS {
     // Clean up user session
     pub fn on_connection_close(&mut self, id: i32) {
         self.users.remove(&id);
+        #[cfg(feature = "gdesk")]
+        for display in self.displays.values_mut() {
+            display.gdesk_tile_acks.remove(&id);
+        }
         if self.users.is_empty() {
             *self = Default::default();
             return;
@@ -932,6 +971,34 @@ mod tests {
         }
         assert_eq!(qos.fps(), FPS);
         qos
+    }
+
+    #[cfg(feature = "gdesk")]
+    #[test]
+    fn gdesk_tile_ack_bitmap_is_forwarded_to_its_display_once() {
+        let mut qos = stable_qos();
+        qos.new_display("monitor0".to_owned());
+        qos.new_display("monitor1".to_owned());
+        let ack = gdesk::GDeskAck { acked_frame_seq: 7, tile_ack_bitmap: vec![0b101], ..Default::default() };
+        qos.queue_gdesk_tile_ack(1, 1, ack.clone());
+        assert!(qos.take_gdesk_tile_acks("monitor0").is_empty());
+        let next = gdesk::GDeskAck { acked_frame_seq: 8, tile_ack_bitmap: vec![0b010], ..Default::default() };
+        qos.queue_gdesk_tile_ack(1, 1, next.clone());
+        assert_eq!(qos.take_gdesk_tile_acks("monitor1"), vec![(1, ack.clone()), (1, next)]);
+        assert!(qos.take_gdesk_tile_acks("monitor1").is_empty());
+        qos.queue_gdesk_tile_ack(1, 0, gdesk::GDeskAck::default());
+        assert!(qos.take_gdesk_tile_acks("monitor0").is_empty());
+        qos.users.insert(2, UserData::default());
+        qos.queue_gdesk_tile_ack(1, 0, ack);
+        assert!(qos.take_gdesk_tile_acks("monitor0").is_empty(), "one viewer cannot confirm another viewer's tile cache");
+        qos.users.remove(&2);
+        for seq in 0..40 {
+            qos.queue_gdesk_tile_ack(1, 0, gdesk::GDeskAck { acked_frame_seq: seq, tile_ack_bitmap: vec![1], ..Default::default() });
+        }
+        let queued = qos.take_gdesk_tile_acks("monitor0");
+        assert_eq!(queued.len(), 32);
+        assert_eq!((queued[0].1.acked_frame_seq, queued[31].1.acked_frame_seq), (8, 39));
+
     }
 
     #[cfg(feature = "gdesk")]

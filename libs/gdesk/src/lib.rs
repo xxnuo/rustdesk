@@ -9,6 +9,7 @@ pub mod protocol;
 pub mod qos;
 pub mod sched;
 pub mod state;
+pub mod udp;
 pub mod wake;
 
 pub use decoder::GDeskDecoder;

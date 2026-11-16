@@ -167,7 +167,12 @@ fn create_broadcast_sockets() -> Vec<UdpSocket> {
     // But currently, it's ok to use `[Ipv4Addr::UNSPECIFIED]` for discovery.
     // `default_net::get_interfaces()` causes undefined symbols error when `flutter build` on iOS simulator x86_64
     #[cfg(not(any(target_os = "ios")))]
-    for interface in default_net::get_interfaces() {
+    #[allow(unused_mut)]
+    let mut interfaces = default_net::get_interfaces();
+    #[cfg(all(feature = "gdesk", not(target_os = "ios")))]
+    crate::common::prioritize_physical_interfaces(&mut interfaces);
+    #[cfg(not(any(target_os = "ios")))]
+    for interface in interfaces {
         for ipv4 in &interface.ipv4 {
             ipv4s.push(ipv4.addr.clone());
         }

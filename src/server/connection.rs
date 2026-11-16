@@ -433,6 +433,8 @@ pub struct Connection {
     pressed_modifiers: HashSet<rdev::Key>,
     #[cfg(feature = "gdesk")]
     gdesk_input: gdesk::input::InputGuard,
+    #[cfg(feature = "gdesk")]
+    gdesk_redundant_input: gdesk::udp::InputRedundancyRx,
     closed: bool,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     start_cm_ipc_para: Option<StartCmIpcPara>,
@@ -653,6 +655,8 @@ impl Connection {
             pressed_modifiers: Default::default(),
             #[cfg(feature = "gdesk")]
             gdesk_input: Default::default(),
+            #[cfg(feature = "gdesk")]
+            gdesk_redundant_input: Default::default(),
             closed: false,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             start_cm_ipc_para: Some(StartCmIpcPara {
@@ -756,6 +760,8 @@ impl Connection {
         let mut video_pace_until = Instant::now();
         #[cfg(feature = "gdesk")]
         let mut video_paced = false;
+        #[cfg(feature = "gdesk")]
+        let mut gdesk_datagrams = std::collections::VecDeque::<(Instant, Message)>::new();
         loop {
             #[cfg(feature = "gdesk")]
             {
@@ -767,7 +773,7 @@ impl Connection {
                 }
             }
             #[cfg(feature = "gdesk")]
-            let video_ready = Instant::now() >= video_pace_until;
+            let video_ready = Instant::now() >= video_pace_until && gdesk_datagrams.is_empty();
             #[cfg(not(feature = "gdesk"))]
             let video_ready = true;
             #[cfg(feature = "gdesk")]
@@ -779,10 +785,32 @@ impl Connection {
                     .user_gdesk_send_backlog(id, false);
             }
             #[cfg(feature = "gdesk")]
-            let pace_wait = video_pace_until.saturating_duration_since(Instant::now());
+            let pace_wait = if gdesk_datagrams.is_empty() {
+                video_pace_until.saturating_duration_since(Instant::now())
+            } else { Duration::from_millis(30) };
             #[cfg(not(feature = "gdesk"))]
             let pace_wait = Duration::ZERO;
+            #[cfg(feature = "gdesk")]
+            let gdesk_ready_at = gdesk_datagrams.front().map(|(at, _)| *at);
+            #[cfg(not(feature = "gdesk"))]
+            let gdesk_ready_at: Option<Instant> = None;
+            let wait_gdesk_datagram = async {
+                if let Some(at) = gdesk_ready_at { time::sleep_until(at).await; }
+                else { std::future::pending::<()>().await; }
+            };
             tokio::select! {
+                _ = wait_gdesk_datagram => {
+                    #[cfg(feature = "gdesk")]
+                    if let Some((_, message)) = gdesk_datagrams.pop_front() {
+                        let send_started = Instant::now();
+                        if let Err(err) = conn.stream.send(&message).await {
+                            conn.on_close(&err.to_string(), false).await;
+                            break;
+                        }
+                        video_service::VIDEO_QOS.lock().unwrap()
+                            .user_gdesk_send_backlog(id, send_started.elapsed() > Duration::from_millis(5));
+                    }
+                }
                 // biased; // video has higher priority // causing test_delay_timer failed while transferring big file
                 Some((_, value)) = rx_p0.recv() => {
                     if let Err(err) = conn.stream.send(&value as &Message).await {
@@ -1150,7 +1178,25 @@ impl Connection {
                     };
                     #[cfg(feature = "gdesk")]
                     let send_started = Instant::now();
-                    if let Err(err) = conn.stream.send(&value as &Message).await {
+                    #[cfg(feature = "gdesk")]
+                    if let Some(message::Union::VideoFrame(video)) = &value.union {
+                        if matches!(&video.union, Some(video_frame::Union::Gdesks(frames))
+                            if !frames.frames.is_empty() && frames.frames.iter().all(|frame| frame.gdesk_datagram))
+                        {
+                            match enqueue_gdesk_datagrams(&mut gdesk_datagrams, video, Instant::now()) {
+                                Ok(()) => continue,
+                                Err(err) => {
+                                    conn.on_close(&err.to_string(), false).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(feature = "gdesk")]
+                    let send_result = conn.stream.send(&value as &Message).await;
+                    #[cfg(not(feature = "gdesk"))]
+                    let send_result = conn.stream.send(&value as &Message).await;
+                    if let Err(err) = send_result {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
@@ -2043,6 +2089,15 @@ impl Connection {
             version: VERSION.to_owned(),
             ..Default::default()
         };
+        #[cfg(feature = "gdesk")]
+        if self.lr.option.as_ref().is_some_and(|option| option.supported_decoding.gdesk_input_redundancy) {
+            let lease = hbb_common::sodiumoxide::randombytes::randombytes_uniform(u32::MAX - 1) + 1;
+            self.gdesk_input.rotate_lease(lease);
+            let mut guard = gdesk::input::InputGuard::default();
+            guard.rotate_lease(lease);
+            self.gdesk_redundant_input = gdesk::udp::InputRedundancyRx::new(guard);
+            pi.gdesk_session_lease_id = lease;
+        }
 
         #[cfg(not(target_os = "android"))]
         {
@@ -2564,6 +2619,28 @@ impl Connection {
         event: Option<(u16, bool)>,
         discrete: bool,
     ) -> bool {
+        use gdesk::input::InputVerdict;
+        match self.gdesk_input.check(lease, modifier_mask as u16, event) {
+            InputVerdict::Reject => {
+                hbb_common::throttled_log!(
+                    Duration::from_secs(10),
+                    warn,
+                    "reject input with stale session lease {lease}"
+                );
+                false
+            }
+            InputVerdict::Accept { release } => {
+                self.release_gdesk_modifiers(release);
+                if discrete || release != 0 {
+                    gdesk::wake::global().notify_after(gdesk::wake::INPUT_WAKE_DELAY);
+                }
+                true
+            }
+        }
+    }
+
+    #[cfg(all(feature = "gdesk", not(any(target_os = "android", target_os = "ios"))))]
+    fn release_gdesk_modifiers(&self, release: u16) {
         use gdesk::input::*;
         const MODIFIER_KEYS: [(u16, ControlKey); 8] = [
             (MOD_LCTRL, ControlKey::Control),
@@ -2575,27 +2652,11 @@ impl Connection {
             (MOD_LMETA, ControlKey::Meta),
             (MOD_RMETA, ControlKey::RWin),
         ];
-        match self.gdesk_input.check(lease, modifier_mask as u16, event) {
-            InputVerdict::Reject => {
-                hbb_common::throttled_log!(
-                    Duration::from_secs(10),
-                    warn,
-                    "reject input with stale session lease {lease}"
-                );
-                false
-            }
-            InputVerdict::Accept { release } => {
-                for (bit, key) in MODIFIER_KEYS {
-                    if release & bit != 0 {
-                        let mut up = KeyEvent::new();
-                        up.set_control_key(key);
-                        self.input_key(up, false);
-                    }
-                }
-                if discrete || release != 0 {
-                    gdesk::wake::global().notify_after(gdesk::wake::INPUT_WAKE_DELAY);
-                }
-                true
+        for (bit, key) in MODIFIER_KEYS {
+            if release & bit != 0 {
+                let mut up = KeyEvent::new();
+                up.set_control_key(key);
+                self.input_key(up, false);
             }
         }
     }
@@ -4111,7 +4172,28 @@ impl Connection {
                         }
                     }
                     #[cfg(feature = "gdesk")]
+                    Some(misc::Union::GdeskInputPacket(packet)) => {
+                        if !self.peer_keyboard_enabled() || self.is_authed_view_camera_conn() {
+                            return true;
+                        }
+                        match gdesk_decode_input_packet(&mut self.gdesk_redundant_input, &packet) {
+                            Ok(messages) => for (message, release) in messages {
+                                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                                self.release_gdesk_modifiers(release);
+                                #[cfg(any(target_os = "android", target_os = "ios"))]
+                                let _ = release;
+                                if !Box::pin(self.on_message(message)).await { return false; }
+                            },
+                            Err(err) => hbb_common::throttled_log!(Duration::from_secs(10), warn,
+                                "Invalid GDesk redundant input: {err}"),
+                        }
+                    }
+                    #[cfg(feature = "gdesk")]
                     Some(misc::Union::GdeskAck(ack)) => {
+                        if ack.tile_ack_bitmap.len() > gdesk::protocol::MAX_TILES.div_ceil(8) {
+                            return true;
+                        }
+                        let display = ack.display;
                         let ack = gdesk::GDeskAck {
                             acked_frame_seq: ack.acked_frame_seq,
                             echo_capture_ts_us: ack.echo_capture_ts_us,
@@ -4119,10 +4201,9 @@ impl Connection {
                             render_queue_depth: ack.render_queue_depth.min(u8::MAX as u32) as u8,
                             tile_ack_bitmap: ack.tile_ack_bitmap.to_vec(),
                         };
-                        video_service::VIDEO_QOS
-                            .lock()
-                            .unwrap()
-                            .user_gdesk_ack(self.inner.id(), &ack);
+                        let mut qos = video_service::VIDEO_QOS.lock().unwrap();
+                        qos.user_gdesk_ack(self.inner.id(), &ack);
+                        qos.queue_gdesk_tile_ack(self.inner.id(), display, ack);
                     }
                     Some(misc::Union::VideoReceived(_)) => {
                         video_service::notify_video_frame_fetched_by_conn_id(
@@ -8080,7 +8161,7 @@ mod test {
     }
 }
 
-#[cfg(all(feature = "gdesk", not(any(target_os = "android", target_os = "ios"))))]
+#[cfg(feature = "gdesk")]
 fn gdesk_modifier_event(me: &KeyEvent) -> Option<(u16, bool)> {
     use gdesk::input::*;
     if me.press {
@@ -8101,4 +8182,109 @@ fn gdesk_modifier_event(me: &KeyEvent) -> Option<(u16, bool)> {
         _ => return None,
     };
     Some((bit, me.down))
+}
+
+#[cfg(feature = "gdesk")]
+pub(crate) fn gdesk_decode_input_packet(
+    rx: &mut gdesk::udp::InputRedundancyRx,
+    packet: &[u8],
+) -> ResultType<Vec<(Message, u16)>> {
+    if packet.len() > gdesk::udp::GDESK_UDP_MTU {
+        bail!("GDesk input packet exceeds MTU");
+    }
+    let pending =
+        gdesk::udp::decode_input_packet(packet).map_err(|e| hbb_common::anyhow::anyhow!("{e}"))?;
+    for event in &pending {
+        let msg = Message::parse_from_bytes(&event.payload)?;
+        if !matches!(
+            msg.union,
+            Some(message::Union::KeyEvent(_)) | Some(message::Union::MouseEvent(_))
+        ) {
+            bail!("GDesk redundant packet must contain only input events");
+        }
+    }
+    rx.receive_with(packet, |event| {
+        let msg = Message::parse_from_bytes(&event.payload).ok()?;
+        let Some(message::Union::KeyEvent(key)) = msg.union else {
+            return None;
+        };
+        gdesk_modifier_event(&key)
+    })
+    .map_err(|e| hbb_common::anyhow::anyhow!("{e}"))?
+    .into_iter()
+    .map(|event| {
+        Message::parse_from_bytes(&event.payload)
+            .map(|message| (message, event.release))
+            .map_err(Into::into)
+    })
+    .collect()
+}
+
+#[cfg(feature = "gdesk")]
+fn gdesk_datagram_pacing(frames: &[EncodedVideoFrame]) -> ResultType<Vec<Duration>> {
+    let lengths: Vec<usize> = frames.iter().map(|frame| frame.data.len()).collect();
+    if lengths.iter().any(|len| *len > gdesk::udp::GDESK_UDP_MTU) {
+        bail!("GDesk video datagram exceeds MTU");
+    }
+    Ok(gdesk::udp::pacing_offsets_us(&lengths)
+        .into_iter()
+        .map(Duration::from_micros)
+        .collect())
+}
+
+#[cfg(feature = "gdesk")]
+fn enqueue_gdesk_datagrams(
+    queue: &mut std::collections::VecDeque<(Instant, Message)>,
+    video: &VideoFrame,
+    started: Instant,
+) -> ResultType<()> {
+    let Some(video_frame::Union::Gdesks(frames)) = &video.union else {
+        return Ok(());
+    };
+    let offsets = gdesk_datagram_pacing(&frames.frames)?;
+    for (frame, offset) in frames.frames.iter().zip(offsets) {
+        let mut part = EncodedVideoFrames::new();
+        part.frames.push(frame.clone());
+        let mut vf = VideoFrame::new();
+        vf.display = video.display;
+        vf.set_gdesks(part);
+        let mut msg = Message::new();
+        msg.set_video_frame(vf);
+        queue.push_back((started + offset, msg));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "gdesk"))]
+mod gdesk_pacing_tests {
+    use super::*;
+    #[test]
+    fn gdesk_video_sender_spreads_datagram_bursts_within_four_ms() {
+        let frames = vec![
+            EncodedVideoFrame {
+                data: vec![0; 1200].into(),
+                gdesk_datagram: true,
+                ..Default::default()
+            };
+            100
+        ];
+        let mut frames_message = EncodedVideoFrames::new();
+        frames_message.frames = frames.clone();
+        let mut video = VideoFrame::new();
+        video.set_gdesks(frames_message);
+        let now = Instant::now();
+        let mut queued = std::collections::VecDeque::new();
+        enqueue_gdesk_datagrams(&mut queued, &video, now).unwrap();
+        assert_eq!(queued.len(), frames.len());
+        assert_eq!(queued.pop_front().unwrap().0, now);
+        assert!(queued.back().unwrap().0 < now + Duration::from_millis(4));
+        let offsets = gdesk_datagram_pacing(&frames).unwrap();
+        assert_eq!(offsets[0], Duration::ZERO);
+        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(offsets[99] >= Duration::from_millis(3) && offsets[99] < Duration::from_millis(4));
+        assert_eq!(
+            gdesk_datagram_pacing(&frames[..1]).unwrap(),
+            vec![Duration::ZERO]
+        );
+    }
 }

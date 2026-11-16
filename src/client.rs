@@ -4170,6 +4170,8 @@ pub fn start_video_thread<F, T>(
                             let mut pixelbuffer = true;
                             let mut tmp_chroma = None;
                             let format_changed = handler.decoder.format() != format;
+                            #[cfg(feature = "gdesk")]
+                            let gdesk_ack = io_loop::gdesk_frame_header(&vf).map(|header| (header, gdesk::monotonic_us()));
                             match handler.handle_frame(vf, &mut pixelbuffer, &mut tmp_chroma) {
                                 Ok(true) => {
                                     video_callback(
@@ -4179,6 +4181,12 @@ pub fn start_video_thread<F, T>(
                                         pixelbuffer,
                                     );
 
+                                    #[cfg(feature = "gdesk")]
+                                    if let Some((header, received_us)) = gdesk_ack {
+                                        session.send(Data::Message(io_loop::gdesk_decoded_frame_ack(
+                                            &handler.decoder, header, display, received_us, video_queue.read().unwrap().len(),
+                                        )));
+                                    }
                                     // chroma
                                     if tmp_chroma.is_some() && last_chroma != tmp_chroma {
                                         last_chroma = tmp_chroma;

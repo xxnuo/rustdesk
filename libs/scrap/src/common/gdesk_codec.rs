@@ -25,6 +25,32 @@ impl std::fmt::Display for GDeskNoOutput {
 impl std::error::Error for GDeskNoOutput {}
 
 impl GDeskEncoderApi {
+    pub fn enable_udp_datagrams(&mut self, enabled: bool) -> ResultType<()> {
+        if enabled != self.datagram_mode {
+            self.inner
+                .reset(u16::try_from(self.width)?, u16::try_from(self.height)?)
+                .map_err(|e| anyhow!("gdesk datagram mode reset failed: {e}"))?;
+            self.datagram_mode = enabled;
+        }
+        Ok(())
+    }
+
+    pub fn apply_tile_ack_bitmap(&mut self, acked_frame_seq: u32, bitmap: &[u8]) -> ResultType<()> {
+        self.inner
+            .apply_tile_ack_bitmap(acked_frame_seq, bitmap)
+            .map_err(|e| anyhow!("gdesk tile acknowledgement failed: {e}"))
+    }
+
+    pub fn encode_udp_datagrams(
+        &mut self,
+        pixels: &[u8],
+        capture_ts_us: u64,
+    ) -> ResultType<Vec<Vec<u8>>> {
+        self.inner
+            .encode_udp_datagrams(pixels, self.width * 4, PixelFormat::Bgra, capture_ts_us)
+            .map_err(|e| anyhow!("gdesk udp encode failed: {e}"))
+    }
+
     pub fn resize_seamless(
         &mut self,
         width: usize,
@@ -53,6 +79,7 @@ pub struct GDeskEncoderApi {
     inner: GDeskEncoder,
     width: usize,
     height: usize,
+    datagram_mode: bool,
 }
 
 fn to_video_frame(bytes: Vec<u8>, ms: i64) -> ResultType<VideoFrame> {
@@ -68,6 +95,21 @@ fn to_video_frame(bytes: Vec<u8>, ms: i64) -> ResultType<VideoFrame> {
         pts: ms,
         ..Default::default()
     });
+    let mut vf = VideoFrame::new();
+    vf.set_gdesks(frames);
+    Ok(vf)
+}
+
+fn datagrams_to_video_frame(datagrams: Vec<Vec<u8>>, ms: i64) -> ResultType<VideoFrame> {
+    let mut frames = EncodedVideoFrames::new();
+    for datagram in datagrams {
+        frames.frames.push(EncodedVideoFrame {
+            data: datagram.into(),
+            gdesk_datagram: true,
+            pts: ms,
+            ..Default::default()
+        });
+    }
     let mut vf = VideoFrame::new();
     vf.set_gdesks(frames);
     Ok(vf)
@@ -92,11 +134,19 @@ impl EncoderApi for GDeskEncoderApi {
             inner,
             width: cfg.width,
             height: cfg.height,
+            datagram_mode: false,
         })
     }
 
     fn encode_to_message(&mut self, frame: EncodeInput, ms: i64) -> ResultType<VideoFrame> {
         let pixels = frame.yuv()?;
+        if self.datagram_mode {
+            let datagrams = self.encode_udp_datagrams(pixels, gdesk::monotonic_us())?;
+            if datagrams.is_empty() {
+                return Err(GDeskNoOutput.into());
+            }
+            return datagrams_to_video_frame(datagrams, ms);
+        }
         match self
             .inner
             .encode_frame(
@@ -113,6 +163,17 @@ impl EncoderApi for GDeskEncoderApi {
     }
 
     fn poll_refinement(&mut self, ms: i64) -> ResultType<Option<VideoFrame>> {
+        if self.datagram_mode {
+            let datagrams = self
+                .inner
+                .poll_refinement_udp_datagrams(gdesk::monotonic_us())
+                .map_err(|e| anyhow!("gdesk datagram refinement failed: {e}"))?;
+            return if datagrams.is_empty() {
+                Ok(None)
+            } else {
+                datagrams_to_video_frame(datagrams, ms).map(Some)
+            };
+        }
         match self
             .inner
             .poll_pending_refinement()
@@ -129,11 +190,23 @@ impl EncoderApi for GDeskEncoderApi {
     }
 
     fn has_gdesk_pending_refinement(&self) -> bool {
-        self.inner.has_pending_refinement()
+        if self.datagram_mode {
+            self.inner.has_udp_unconfirmed()
+        } else {
+            self.inner.has_pending_refinement()
+        }
     }
 
     fn resize_gdesk(&mut self, width: usize, height: usize) -> ResultType<()> {
         self.resize_seamless(width, height, Pixfmt::BGRA)
+    }
+
+    fn apply_gdesk_tile_ack(&mut self, acked_frame_seq: u32, bitmap: &[u8]) -> ResultType<()> {
+        self.apply_tile_ack_bitmap(acked_frame_seq, bitmap)
+    }
+
+    fn enable_gdesk_datagrams(&mut self, enabled: bool) -> ResultType<()> {
+        self.enable_udp_datagrams(enabled)
     }
 
     fn is_gdesk(&self) -> bool {
@@ -186,9 +259,18 @@ pub fn decode_into(
 ) -> ResultType<bool> {
     let mut decoded = false;
     for frame in frames.frames.iter() {
-        decoder
-            .decode_frame(&frame.data)
-            .map_err(|e| anyhow!("gdesk decode failed: {e}"))?;
+        if frame.gdesk_datagram {
+            let header = GDeskFrameHeader::from_bytes(&frame.data)
+                .map_err(|e| anyhow!("gdesk datagram header failed: {e}"))?;
+            decoder
+                .decode_udp_datagram(&frame.data)
+                .map_err(|e| anyhow!("gdesk datagram decode failed: {e}"))?;
+            decoder.last_header = Some(header);
+        } else {
+            decoder
+                .decode_frame(&frame.data)
+                .map_err(|e| anyhow!("gdesk decode failed: {e}"))?;
+        }
         decoded = true;
     }
     if !decoded {
@@ -213,6 +295,52 @@ pub fn decode_into(
     Ok(true)
 }
 
+impl crate::codec::Decoder {
+    pub fn gdesk_tile_ack_bitmap(&self) -> Vec<u8> {
+        self.gdesk
+            .as_ref()
+            .and_then(|decoder| {
+                decoder
+                    .last_header
+                    .map(|h| decoder.tile_ack_bitmap(h.frame_seq))
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn handle_gdesk_udp_datagram(
+        &mut self,
+        data: &[u8],
+        rgb: &mut Vec<u8>,
+        width: usize,
+        height: usize,
+        rgba: bool,
+    ) -> ResultType<bool> {
+        let header = GDeskFrameHeader::from_bytes(data)
+            .map_err(|e| anyhow!("gdesk datagram header failed: {e}"))?;
+        if (header.width as usize, header.height as usize) != (width, height) {
+            bail!("gdesk datagram canvas dimensions differ");
+        }
+        let decoder = self
+            .gdesk
+            .as_mut()
+            .ok_or_else(|| anyhow!("gdesk decoder unavailable"))?;
+        let updated = decoder
+            .decode_udp_datagram(data)
+            .map_err(|e| anyhow!("gdesk datagram decode failed: {e}"))?;
+        decoder.last_header = Some(header);
+        let format = if rgba {
+            PixelFormat::Rgba
+        } else {
+            PixelFormat::Rgb
+        };
+        rgb.resize(width * height * format.bytes_per_pixel(), 0);
+        decoder
+            .write_into(rgb, width * format.bytes_per_pixel(), format)
+            .map_err(|e| anyhow!("gdesk datagram output failed: {e}"))?;
+        Ok(!updated.is_empty())
+    }
+}
+
 pub fn is_gdesk_frame(frame: &video_frame::Union) -> bool {
     matches!(frame, video_frame::Union::Gdesks(_))
 }
@@ -220,6 +348,91 @@ pub fn is_gdesk_frame(frame: &video_frame::Union) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gdesk_datagram_mode_emits_decodable_acknowledged_frames() {
+        let mut encoder = GDeskEncoderApi::new(
+            EncoderCfg::GDesk(GDeskEncoderConfig {
+                width: 64,
+                height: 64,
+            }),
+            false,
+        )
+        .unwrap();
+        encoder.enable_udp_datagrams(true).unwrap();
+        let frame = encoder
+            .encode_to_message(EncodeInput::YUV(&[3, 2, 1, 255].repeat(64 * 64)), 1)
+            .unwrap();
+        assert!(frame
+            .gdesks()
+            .frames
+            .iter()
+            .all(|frame| frame.gdesk_datagram));
+        let mut decoder = crate::codec::Decoder::new(crate::CodecFormat::GDesk, None);
+        let mut output = ImageRgb::new(ImageFormat::ABGR, 1);
+        assert!(decoder
+            .handle_video_frame(
+                frame.union.as_ref().unwrap(),
+                &mut output,
+                &mut crate::ImageTexture::default(),
+                &mut true,
+                &mut None
+            )
+            .unwrap());
+        assert_eq!(output.raw, [1, 2, 3, 255].repeat(64 * 64));
+        let bitmap = decoder.gdesk_tile_ack_bitmap();
+        assert_eq!(bitmap, vec![1]);
+        let header = GDeskFrameHeader::from_bytes(&frame.gdesks().frames[0].data).unwrap();
+        encoder
+            .apply_tile_ack_bitmap(header.frame_seq, &bitmap)
+            .unwrap();
+        assert!(!encoder.has_gdesk_pending_refinement());
+        assert!(encoder.poll_refinement(2).unwrap().is_none());
+    }
+
+    #[test]
+    fn gdesk_udp_decoder_exports_tile_ack_and_rejects_wrong_extent() {
+        let mut encoder = GDeskEncoderApi::new(
+            EncoderCfg::GDesk(GDeskEncoderConfig {
+                width: 64,
+                height: 64,
+            }),
+            false,
+        )
+        .unwrap();
+        let packets = encoder
+            .encode_udp_datagrams(&[3, 2, 1, 255].repeat(64 * 64), 1)
+            .unwrap();
+        let mut decoder = crate::codec::Decoder::new(crate::CodecFormat::GDesk, None);
+        let mut rgb = Vec::new();
+        assert!(decoder
+            .handle_gdesk_udp_datagram(&packets[0], &mut rgb, 32, 64, true)
+            .is_err());
+        assert!(decoder
+            .handle_gdesk_udp_datagram(&packets[0], &mut rgb, 64, 64, true)
+            .unwrap());
+        assert_eq!(rgb, [1, 2, 3, 255].repeat(64 * 64));
+        assert_eq!(decoder.gdesk_tile_ack_bitmap(), vec![1]);
+        let mut decoder = crate::codec::Decoder::new(crate::CodecFormat::GDesk, None);
+        let mut frames = EncodedVideoFrames::new();
+        frames.frames.push(EncodedVideoFrame {
+            data: packets[0].clone().into(),
+            gdesk_datagram: true,
+            ..Default::default()
+        });
+        let mut output = ImageRgb::new(ImageFormat::ABGR, 1);
+        assert!(decoder
+            .handle_video_frame(
+                &video_frame::Union::Gdesks(frames),
+                &mut output,
+                &mut crate::ImageTexture::default(),
+                &mut true,
+                &mut None
+            )
+            .unwrap());
+        assert_eq!(output.raw, rgb);
+        assert_eq!(decoder.gdesk_tile_ack_bitmap(), vec![1]);
+    }
 
     #[test]
     fn qos_trait_hooks_freeze_and_resume_refinement() {

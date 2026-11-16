@@ -5,6 +5,12 @@ use crate::{
 use std::collections::{HashMap, VecDeque};
 
 pub const CACHE_CAPACITY: usize = 4096;
+/// Pure function of the tile hash, so a sender and a receiver that see the same lossless tiles in
+/// any order and with any losses agree on the slot.
+pub fn deterministic_slot(hash: u64) -> u16 {
+    ((hash ^ (hash >> 16)) as u16) & (CACHE_CAPACITY as u16 - 1)
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub hash: u64,
@@ -95,6 +101,35 @@ impl DeterministicLruCache {
         self.confirmed_slots[slot as usize] = false;
         self.lru.push_front(slot);
         Ok(slot)
+    }
+    /// Direct-mapped insert; a slot already holding the same tile keeps its confirmation.
+    pub fn insert_at_slot(&mut self, slot: u16, rgb: &[u8]) -> Result<()> {
+        if rgb.len() != TILE_RGB_BYTES || slot as usize >= self.slots.len() {
+            return Err(Error("invalid cached tile"));
+        }
+        let hash = tile_hash(rgb);
+        if let Some(old) = self.slots[slot as usize].take() {
+            if old.hash == hash && old.rgb == rgb {
+                self.slots[slot as usize] = Some(old);
+                return Ok(());
+            }
+            if let Some(slots) = self.hashes.get_mut(&old.hash) {
+                slots.retain(|s| *s != slot);
+                if slots.is_empty() {
+                    self.hashes.remove(&old.hash);
+                }
+            }
+        }
+        self.slots[slot as usize] = Some(CacheEntry {
+            hash,
+            rgb: rgb.to_vec(),
+        });
+        self.hashes.entry(hash).or_default().push(slot);
+        self.confirmed_slots[slot as usize] = false;
+        if !self.lru.contains(&slot) {
+            self.lru.push_front(slot);
+        }
+        Ok(())
     }
     pub fn confirm_slot(&mut self, slot: u16) -> Result<()> {
         if self.get(slot).is_none() {

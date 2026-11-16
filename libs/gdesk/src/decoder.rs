@@ -9,11 +9,12 @@ use crate::{
 pub struct GDeskDecoder {
     pub cache: DeterministicLruCache,
     pub last_header: Option<GDeskFrameHeader>,
-    canvas: Vec<u8>,
-    rendered_canvas: Vec<u8>,
-    wavelets: Vec<Option<WaveletState>>,
-    lossless: Vec<bool>,
-    needs_reset: bool,
+    pub(crate) canvas: Vec<u8>,
+    pub(crate) rendered_canvas: Vec<u8>,
+    pub(crate) wavelets: Vec<Option<WaveletState>>,
+    pub(crate) lossless: Vec<bool>,
+    pub(crate) needs_reset: bool,
+    pub udp: crate::udp::UdpDecoderState,
 }
 impl GDeskDecoder {
     pub fn new() -> Self {
@@ -40,6 +41,7 @@ impl GDeskDecoder {
         let reset = header.frame_flags & KEYFRAME_RESET != 0;
         let count = protocol::tile_count(header.width, header.height)?;
         let mut previous_state = None;
+        let mut previous_udp = None;
         if reset {
             if header.frame_flags & CACHE_KEEP != 0 && (self.needs_reset || self.last_header.is_none()) {
                 return Err(Error("cannot keep cache when decoder needs full reset"));
@@ -60,8 +62,12 @@ impl GDeskDecoder {
             if header.frame_flags & CACHE_KEEP == 0 {
                 self.cache.clear();
             }
+            previous_udp = Some(std::mem::take(&mut self.udp));
             self.needs_reset = false;
         } else {
+            if self.udp.active {
+                return Err(Error("decoder requires a reset frame"));
+            }
             let previous = self
                 .last_header
                 .ok_or(Error("first frame must reset canvas"))?;
@@ -79,6 +85,9 @@ impl GDeskDecoder {
                 // A partially applied malformed delta cannot be used as the next frame's base.
                 self.needs_reset = true;
                 self.cache.clear();
+                if let Some(udp) = previous_udp {
+                    self.udp = udp;
+                }
                 if let Some((canvas, rendered, wavelets, lossless)) = previous_state {
                     self.canvas = canvas;
                     self.rendered_canvas = if rendered.is_empty() {
@@ -93,12 +102,15 @@ impl GDeskDecoder {
             }
         }
         self.last_header = Some(header);
+        if reset {
+            self.udp = crate::udp::UdpDecoderState::reliable(header.canvas_epoch);
+        }
         if !self.is_lossless() {
             self.render();
         }
         Ok(self.canvas_rgb())
     }
-    fn apply_record(&mut self, header: &GDeskFrameHeader, record: TileRecord) -> Result<()> {
+    pub(crate) fn apply_record(&mut self, header: &GDeskFrameHeader, record: TileRecord) -> Result<()> {
         let index = record.tile_index() as usize;
         let mut wavelet = None;
         let (rgb, lossless, insert) = match record {
@@ -148,7 +160,7 @@ impl GDeskDecoder {
                 (rgb, lossless, lossless)
             }
         };
-        if insert {
+        if insert && !self.udp.active {
             self.cache.insert(&rgb)?;
         }
         self.wavelets[index] = wavelet;
@@ -163,7 +175,7 @@ impl GDeskDecoder {
             index,
         )
     }
-    fn render(&mut self) {
+    pub(crate) fn render(&mut self) {
         self.rendered_canvas.clone_from(&self.canvas);
         let Some(header) = self.last_header else {
             return;
@@ -460,5 +472,58 @@ mod tests {
             .decode_frame(&frame(KEYFRAME_RESET, 2, 3, vec![solid(0, 50), solid(1, 60)]))
             .unwrap();
         decoder.decode_frame(&keep).unwrap();
+    }
+
+    #[test]
+    fn udp_to_reliable_reset_restores_lru_cache_and_rejects_stale_udp() {
+        let a = image(128, 64, 11);
+        let b = image(128, 64, 77);
+        let mut encoder = GDeskEncoder::new(
+            128,
+            64,
+            GDeskConfig {
+                initial_shifts: Some((0, 0)),
+                refine_min_still_frames: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut decoder = GDeskDecoder::new();
+
+        let udp_datagrams = encoder
+            .encode_udp_datagrams(&a, 384, PixelFormat::Rgb, 1_000)
+            .unwrap();
+        assert!(!udp_datagrams.is_empty());
+        for d in &udp_datagrams {
+            decoder.decode_udp_datagram(d).unwrap();
+        }
+        let mut ts = 2_000;
+        while !decoder.is_lossless() {
+            let refines = encoder.poll_refinement_udp_datagrams(ts).unwrap();
+            assert!(!refines.is_empty());
+            for d in &refines {
+                decoder.decode_udp_datagram(d).unwrap();
+            }
+            ts += 1_000;
+        }
+        assert!(decoder.udp.active);
+        assert_eq!(decoder.canvas_rgb(), &a[..]);
+
+        // Transition back to reliable mode via encoder.reset() + KEYFRAME_RESET frame.
+        encoder.reset(128, 64).unwrap();
+        for rgb in [&a, &b, &a] {
+            let frame = encoder
+                .encode_frame(rgb, 384, PixelFormat::Rgb, 2_000)
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoder.decode_frame(&frame).unwrap(), *rgb);
+        }
+        assert!(!decoder.udp.active);
+        assert!(encoder.stats.cache_hits >= 2);
+        assert_eq!(
+            encoder.cache.lru_slots().collect::<Vec<_>>(),
+            decoder.cache.lru_slots().collect::<Vec<_>>()
+        );
+        assert!(decoder.decode_udp_datagram(&udp_datagrams[0]).is_err());
     }
 }

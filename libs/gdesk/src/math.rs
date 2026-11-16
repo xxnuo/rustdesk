@@ -500,6 +500,98 @@ pub fn decode_wavelet_refine(
     Ok(())
 }
 
+/// Same bitplanes as `encode_wavelet_refine`, restricted to the coefficients whose index is
+/// congruent to `part` modulo `parts`, so one refinement can be spread over several packets.
+pub fn encode_wavelet_refine_part(
+    coeff: &WaveletCoefficients,
+    old: (u8, u8),
+    new: (u8, u8),
+    part: usize,
+    parts: usize,
+) -> Result<Vec<u8>> {
+    validate_shifts(old.0, old.1)?;
+    validate_shifts(new.0, new.1)?;
+    validate_coefficients(coeff)?;
+    if parts == 0 || part >= parts || new.0 > old.0 || new.1 > old.1 || new == old {
+        return Err(Error("invalid refinement transition"));
+    }
+    let mut bits = BitWriter::default();
+    for c in 0..3 {
+        let old_shift = channel_shift(c, old.0, old.1);
+        let new_shift = channel_shift(c, new.0, new.1);
+        let count = old_shift - new_shift;
+        if count == 0 {
+            continue;
+        }
+        let mask = (1u16 << count) - 1;
+        for (i, value) in coeff.planes[c].iter().enumerate() {
+            if ll3(i) || i % parts != part {
+                continue;
+            }
+            let mag = value.unsigned_abs();
+            let delta = (mag >> new_shift) & mask;
+            bits.put(delta, count);
+            if mag >> old_shift == 0 && delta != 0 {
+                bits.put(u16::from(*value < 0), 1);
+            }
+        }
+    }
+    Ok(bits.bytes)
+}
+
+/// Applies one part to the staged state without touching its shifts; the caller commits the new
+/// shifts after the last part.
+pub fn decode_wavelet_refine_part(
+    state: &mut WaveletState,
+    payload: &[u8],
+    new: (u8, u8),
+    part: usize,
+    parts: usize,
+) -> Result<()> {
+    validate_shifts(new.0, new.1)?;
+    validate_shifts(state.shift_y, state.shift_c)?;
+    if parts == 0
+        || part >= parts
+        || new.0 > state.shift_y
+        || new.1 > state.shift_c
+        || new == (state.shift_y, state.shift_c)
+    {
+        return Err(Error("invalid refinement transition"));
+    }
+    let mut next = state.clone();
+    let mut bits = BitReader {
+        bytes: payload,
+        offset: 0,
+    };
+    for c in 0..3 {
+        if next.known_mag[c].len() != TILE_PIXELS || next.sign[c].len() != TILE_PIXELS {
+            return Err(Error("invalid wavelet state"));
+        }
+        let old_shift = channel_shift(c, state.shift_y, state.shift_c);
+        let new_shift = channel_shift(c, new.0, new.1);
+        let count = old_shift - new_shift;
+        if count == 0 {
+            continue;
+        }
+        for i in 0..TILE_PIXELS {
+            if ll3(i) || i % parts != part {
+                continue;
+            }
+            let delta = bits.get(count)?;
+            if next.known_mag[c][i] == 0 && delta != 0 {
+                next.sign[c][i] = bits.get(1)? != 0;
+            }
+            let mag = next.known_mag[c][i] as u32 | ((delta as u32) << new_shift);
+            if mag > 32768 || (mag == 32768 && !next.sign[c][i]) {
+                return Err(Error("coefficient overflow"));
+            }
+            next.known_mag[c][i] = mag as u16;
+        }
+    }
+    bits.finish()?;
+    *state = next;
+    Ok(())
+}
 #[derive(Default)]
 struct BitWriter {
     bytes: Vec<u8>,

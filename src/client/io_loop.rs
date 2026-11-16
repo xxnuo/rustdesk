@@ -95,6 +95,12 @@ pub struct Remote<T: InvokeUiSession> {
     client_conn_id: i32, // used for file clipboard
     data_count: Arc<AtomicUsize>,
     video_format: CodecFormat,
+    #[cfg(feature = "gdesk")]
+    gdesk_input_tx: Option<gdesk::udp::InputRedundancyTx<Vec<u8>>>,
+    #[cfg(feature = "gdesk")]
+    gdesk_input_lease: u32,
+    #[cfg(feature = "gdesk")]
+    gdesk_tail_pending: Option<Instant>,
     elevation_requested: bool,
     peer_info: ParsedPeerInfo,
     video_threads: HashMap<usize, VideoThread>,
@@ -147,6 +153,12 @@ impl<T: InvokeUiSession> Remote<T> {
             client_conn_id: 0,
             data_count: Arc::new(AtomicUsize::new(0)),
             video_format: CodecFormat::Unknown,
+            #[cfg(feature = "gdesk")]
+            gdesk_input_tx: None,
+            #[cfg(feature = "gdesk")]
+            gdesk_input_lease: 0,
+            #[cfg(feature = "gdesk")]
+            gdesk_tail_pending: None,
             stop_voice_call_sender: None,
             voice_call_request_timestamp: None,
             elevation_requested: false,
@@ -291,7 +303,29 @@ impl<T: InvokeUiSession> Remote<T> {
                 let mut peer_gone = false;
 
                 loop {
+                    #[cfg(feature = "gdesk")]
+                    let gdesk_tail_ready_at = self.gdesk_tail_pending;
+                    #[cfg(not(feature = "gdesk"))]
+                    let gdesk_tail_ready_at: Option<Instant> = None;
+                    let wait_gdesk_tail = async {
+                        if let Some(at) = gdesk_tail_ready_at { time::sleep_until(at).await; }
+                        else { std::future::pending::<()>().await; }
+                    };
                     tokio::select! {
+                        _ = wait_gdesk_tail => {
+                            #[cfg(feature = "gdesk")]
+                            {
+                                self.gdesk_tail_pending = None;
+                                if let Some(tx) = self.gdesk_input_tx.as_ref() {
+                                    match gdesk_flush_input(tx) {
+                                        Ok(packets) => for packet in packets {
+                                            allow_err!(peer.send(&gdesk_input_message(packet)).await);
+                                        },
+                                        Err(err) => log::warn!("GDesk input tail flush failed: {err}"),
+                                    }
+                                }
+                            }
+                        }
                         res = peer.next() => {
                             if let Some(res) = res {
                                 match res {
@@ -798,7 +832,16 @@ impl<T: InvokeUiSession> Remote<T> {
                 }
             }
             Data::Message(msg) => {
-                let msg = self.trusted_device.outgoing(msg);
+                #[allow(unused_mut)]
+                let mut msg = self.trusted_device.outgoing(msg);
+                #[cfg(feature = "gdesk")]
+                if self.gdesk_input_lease != 0 {
+                    match &mut msg.union {
+                        Some(message::Union::KeyEvent(key)) => key.gdesk_lease = self.gdesk_input_lease,
+                        Some(message::Union::MouseEvent(mouse)) => mouse.gdesk_lease = self.gdesk_input_lease,
+                        _ => {}
+                    }
+                }
                 // The Flutter clipboard broadcast is process-wide, so a clipboard can reach this
                 // round's queue before the round has logged in; it is dropped here, on the round
                 // itself.
@@ -846,6 +889,25 @@ impl<T: InvokeUiSession> Remote<T> {
                         _ => {}
                     },
                     _ => {}
+                }
+                #[cfg(feature = "gdesk")]
+                if self.video_format == CodecFormat::GDesk
+                    && self.handler.lc.read().unwrap().supported_encoding.gdesk_input_redundancy
+                {
+                    if let Some(tx) = self.gdesk_input_tx.as_mut() {
+                        match gdesk_encode_input(tx, &msg) {
+                            Ok(Some(packets)) => {
+                                for packet in packets {
+                                    allow_err!(peer.send(&gdesk_input_message(packet)).await);
+                                }
+                                self.gdesk_tail_pending = Some(Instant::now() + Duration::from_millis(20));
+                                return true;
+                            }
+                            Ok(None) => {}
+                            Err(err) => hbb_common::throttled_log!(Duration::from_secs(10), warn,
+                                "GDesk input packet failed: {err}"),
+                        }
+                    }
                 }
                 allow_err!(peer.send(&msg).await);
             }
@@ -1715,10 +1777,6 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.send_toggle_privacy_mode_msg(peer).await;
                     }
                     self.video_format = CodecFormat::from(&vf);
-                    #[cfg(feature = "gdesk")]
-                    let gdesk_frame = gdesk_frame_info(&vf);
-                    #[cfg(feature = "gdesk")]
-                    let gdesk_recv_us = gdesk::monotonic_us();
 
                     let display = vf.display as usize;
                     if !self.video_threads.contains_key(&display) {
@@ -1741,20 +1799,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             thread.video_sender.send(MediaData::VideoQueue).ok();
                         }
                     }
-                    #[cfg(feature = "gdesk")]
-                    if let Some((frame_seq, capture_ts_us)) = gdesk_frame {
-                        let depth = thread.video_queue.read().unwrap().len();
-                        let mut ack = GDeskAck::new();
-                        ack.acked_frame_seq = frame_seq;
-                        ack.echo_capture_ts_us = capture_ts_us;
-                        ack.client_recv_ts_us = gdesk_recv_us;
-                        ack.render_queue_depth = depth.min(u8::MAX as usize) as u32;
-                        let mut misc = Misc::new();
-                        misc.set_gdesk_ack(ack);
-                        let mut msg_out = Message::new();
-                        msg_out.set_misc(misc);
-                        allow_err!(peer.send(&msg_out).await);
-                    }
+
                 }
                 Some(message::Union::Hash(hash)) => {
                     if !self
@@ -1785,6 +1830,13 @@ impl<T: InvokeUiSession> Remote<T> {
                         let peer_version = pi.version.clone();
                         let peer_platform = pi.platform.clone();
                         self.set_peer_info(&pi);
+                        #[cfg(feature = "gdesk")]
+                        {
+                            self.gdesk_input_lease = pi.gdesk_session_lease_id;
+                            self.gdesk_input_tx = (self.gdesk_input_lease != 0)
+                                .then(|| gdesk::udp::InputRedundancyTx::new(self.gdesk_input_lease));
+                            self.gdesk_tail_pending = None;
+                        }
                         if self.handler.is_view_camera() {
                             if !self.check_view_camera_support(&peer_version, &peer_platform) {
                                 self.handler.lc.write().unwrap().handle_peer_info(&pi);
@@ -3353,10 +3405,144 @@ mod kept_cursor_tests {
 }
 
 #[cfg(feature = "gdesk")]
-fn gdesk_frame_info(vf: &VideoFrame) -> Option<(u32, u64)> {
+pub(super) fn gdesk_frame_header(vf: &VideoFrame) -> Option<gdesk::GDeskFrameHeader> {
     let Some(video_frame::Union::Gdesks(frames)) = &vf.union else {
         return None;
     };
-    let header = gdesk::GDeskFrameHeader::from_bytes(&frames.frames.last()?.data).ok()?;
-    Some((header.frame_seq, header.capture_ts_us))
+    gdesk::GDeskFrameHeader::from_bytes(&frames.frames.last()?.data).ok()
+}
+
+#[cfg(feature = "gdesk")]
+pub(super) fn gdesk_decoded_frame_ack(
+    decoder: &scrap::codec::Decoder,
+    header: gdesk::GDeskFrameHeader,
+    display: usize,
+    received_us: u64,
+    queue_depth: usize,
+) -> Message {
+    let mut ack = GDeskAck::new();
+    ack.acked_frame_seq = header.frame_seq;
+    ack.echo_capture_ts_us = header.capture_ts_us;
+    ack.client_recv_ts_us = received_us;
+    ack.render_queue_depth = queue_depth.min(u8::MAX as usize) as u32;
+    ack.display = display as u32;
+    ack.tile_ack_bitmap = decoder.gdesk_tile_ack_bitmap().into();
+    let mut misc = Misc::new();
+    misc.set_gdesk_ack(ack);
+    let mut msg = Message::new();
+    msg.set_misc(misc);
+    msg
+}
+
+#[cfg(feature = "gdesk")]
+pub(super) fn gdesk_encode_input(
+    tx: &mut gdesk::udp::InputRedundancyTx<Vec<u8>>,
+    message: &Message,
+) -> hbb_common::ResultType<Option<Vec<Vec<u8>>>> {
+    let mask = match &message.union {
+        Some(message::Union::KeyEvent(event)) => event.gdesk_modifier_mask,
+        Some(message::Union::MouseEvent(event)) if event.mask & 7 != 0 => event.gdesk_modifier_mask,
+        _ => return Ok(None),
+    };
+    let packets = tx
+        .push_with_redundancy(mask as u16, message.write_to_bytes()?, 2)
+        .map_err(|e| hbb_common::anyhow::anyhow!("{e}"))?;
+    Ok(Some(packets))
+}
+
+#[cfg(feature = "gdesk")]
+fn gdesk_input_message(packet: Vec<u8>) -> Message {
+    let mut misc = Misc::new();
+    misc.set_gdesk_input_packet(packet.into());
+    let mut encoded = Message::new();
+    encoded.set_misc(misc);
+    encoded
+}
+
+#[cfg(feature = "gdesk")]
+fn gdesk_flush_input(
+    tx: &gdesk::udp::InputRedundancyTx<Vec<u8>>,
+) -> hbb_common::ResultType<Vec<Vec<u8>>> {
+    tx.flush_tail(1)
+        .map_err(|e| hbb_common::anyhow::anyhow!("{e}"))
+}
+
+#[cfg(all(test, feature = "gdesk"))]
+mod gdesk_transport_tests {
+    use super::*;
+    #[test]
+    fn gdesk_input_helpers_recover_lost_packet_and_ignore_duplicates() {
+        let mut tx = gdesk::udp::InputRedundancyTx::new(7);
+        let mut rx = gdesk::udp::InputRedundancyRx::default();
+        for index in 0..3 {
+            let mut msg = Message::new();
+            msg.set_key_event(KeyEvent {
+                down: index != 2,
+                ..Default::default()
+            });
+            let packets = gdesk_encode_input(&mut tx, &msg).unwrap().unwrap();
+            assert_eq!(packets.len(), 2);
+            assert_eq!(packets[0], packets[1]);
+            assert!(gdesk::udp::decode_input_packet(&packets[0])
+                .unwrap()
+                .iter()
+                .all(|event| event.lease_id == 7));
+            let packet = &packets[0];
+            if index == 0 {
+                continue;
+            }
+            let expected = if index == 1 { 2 } else { 1 };
+            assert_eq!(
+                crate::server::gdesk_decode_input_packet(&mut rx, &packet)
+                    .unwrap()
+                    .len(),
+                expected
+            );
+            assert!(crate::server::gdesk_decode_input_packet(&mut rx, &packet)
+                .unwrap()
+                .is_empty());
+        }
+        let tail = gdesk_flush_input(&tx).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert!(crate::server::gdesk_decode_input_packet(&mut rx, &tail[0])
+            .unwrap()
+            .is_empty());
+        let mut ctrl = Message::new();
+        let mut key = KeyEvent::new();
+        key.set_control_key(ControlKey::Control);
+        key.down = true;
+        ctrl.set_key_event(key);
+        let packets = gdesk_encode_input(&mut tx, &ctrl).unwrap().unwrap();
+        let pressed = crate::server::gdesk_decode_input_packet(&mut rx, &packets[0]).unwrap();
+        assert_eq!(pressed.last().unwrap().1, 0);
+        let mut mouse = Message::new();
+        mouse.set_mouse_event(MouseEvent::new());
+        tx.push(0, mouse.write_to_bytes().unwrap());
+        let released =
+            crate::server::gdesk_decode_input_packet(&mut rx, &gdesk_flush_input(&tx).unwrap()[0])
+                .unwrap();
+        assert_eq!(released.last().unwrap().1, gdesk::input::MOD_LCTRL);
+    }
+    #[test]
+    fn gdesk_decoded_ack_contains_the_applied_tile_bitmap() {
+        let mut encoder = gdesk::GDeskEncoder::new(64, 64, Default::default()).unwrap();
+        let packet = encoder
+            .encode_udp_datagrams(
+                &[1, 2, 3].repeat(64 * 64),
+                64 * 3,
+                gdesk::PixelFormat::Rgb,
+                1,
+            )
+            .unwrap()
+            .remove(0);
+        let mut decoder = scrap::codec::Decoder::new(CodecFormat::GDesk, None);
+        let mut rgb = Vec::new();
+        decoder
+            .handle_gdesk_udp_datagram(&packet, &mut rgb, 64, 64, true)
+            .unwrap();
+        let header = gdesk::GDeskFrameHeader::from_bytes(&packet).unwrap();
+        let ack = gdesk_decoded_frame_ack(&decoder, header, 2, 50, 0);
+        assert_eq!(ack.misc().gdesk_ack().tile_ack_bitmap.as_ref(), &[1]);
+        assert_eq!(ack.misc().gdesk_ack().display, 2);
+    }
 }

@@ -771,6 +771,10 @@ fn run(vs: VideoService) -> ResultType<()> {
         )?;
         #[cfg(feature = "gdesk")]
         if encoder.is_gdesk() {
+            encoder.enable_gdesk_datagrams(Config::get_option("gdesk-udp-datagrams") == "Y"
+                && Encoder::gdesk_datagrams_supported())?;
+            let acks = VIDEO_QOS.lock().unwrap().take_gdesk_tile_acks(&sp.name());
+            apply_gdesk_tile_acks(encoder.codec.as_mut(), acks);
             let (state, skip) = {
                 let mut video_qos = VIDEO_QOS.lock().unwrap();
                 (
@@ -1506,6 +1510,22 @@ fn start_uac_elevation_check() {
 }
 
 #[cfg(feature = "gdesk")]
+fn apply_gdesk_tile_acks(
+    encoder: &mut dyn scrap::codec::EncoderApi,
+    acks: Vec<(i32, gdesk::GDeskAck)>,
+) {
+    for (id, ack) in acks {
+        if let Err(err) = encoder.apply_gdesk_tile_ack(ack.acked_frame_seq, &ack.tile_ack_bitmap) {
+            hbb_common::throttled_log!(
+                Duration::from_secs(10),
+                warn,
+                "Invalid GDesk tile acknowledgement from {id}: {err}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "gdesk")]
 fn gdesk_recreate_capture(
     capture: &mut CapturerInfo,
     encoder: &mut Encoder,
@@ -1745,6 +1765,35 @@ fn handle_screenshot(screenshot: Screenshot, msg: String, w: usize, h: usize, da
 #[cfg(test)]
 mod tests {
     use super::refresh_allowed;
+
+    #[cfg(feature = "gdesk")]
+    #[test]
+    fn gdesk_qos_ack_retransmits_only_missing_tiles_through_encoder_api() {
+        use scrap::{codec::EncoderApi, gdesk_codec::{GDeskEncoderApi, GDeskEncoderConfig}};
+        let mut encoder = GDeskEncoderApi::new(super::EncoderCfg::GDesk(
+            GDeskEncoderConfig { width: 128, height: 64 }
+        ), false).unwrap();
+        let pixels: Vec<u8> = (0..128 * 64).flat_map(|i| {
+            if i % 128 < 64 { [19, 41, 83, 255] } else { [97, 53, 29, 255] }
+        }).collect();
+        let datagrams = encoder.encode_udp_datagrams(&pixels, 1).unwrap();
+        let (header, first) = gdesk::protocol::decode_frame(&datagrams[0]).unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(encoder.encode_udp_datagrams(&pixels, 2).unwrap().is_empty());
+        let mut qos = super::VideoQoS::default();
+        qos.on_connection_open(71);
+        qos.new_display("monitor0".to_owned());
+        qos.queue_gdesk_tile_ack(71, 0, gdesk::GDeskAck {
+            acked_frame_seq: header.frame_seq, tile_ack_bitmap: vec![0b01], ..Default::default()
+        });
+        super::apply_gdesk_tile_acks(&mut encoder, qos.take_gdesk_tile_acks("monitor0"));
+        let resent = encoder.encode_udp_datagrams(&pixels, 3).unwrap();
+        assert_eq!(resent.len(), 1);
+        let (_, records) = gdesk::protocol::decode_frame(&resent[0]).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tile_index(), 1);
+        assert!(qos.take_gdesk_tile_acks("monitor0").is_empty());
+    }
 
     #[cfg(feature = "gdesk")]
     #[test]

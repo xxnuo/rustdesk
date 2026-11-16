@@ -53,6 +53,20 @@ pub type NotifyMessageBox = fn(String, String, String, String) -> dyn Future<Out
 // the executable name of the portable version
 pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
 
+#[cfg(feature = "gdesk")]
+pub(crate) fn is_virtual_interface_name(name: &str) -> bool {
+    gdesk::udp::is_virtual_nic(name)
+}
+
+#[cfg(all(feature = "gdesk", not(target_os = "ios")))]
+pub(crate) fn prioritize_physical_interfaces(interfaces: &mut [default_net::Interface]) {
+    interfaces.sort_by_key(|interface| {
+        is_virtual_interface_name(&interface.name)
+            || interface.friendly_name.as_deref().is_some_and(is_virtual_interface_name)
+            || interface.description.as_deref().is_some_and(is_virtual_interface_name)
+    });
+}
+
 pub const PLATFORM_WINDOWS: &str = "Windows";
 pub const PLATFORM_LINUX: &str = "Linux";
 pub const PLATFORM_MACOS: &str = "Mac OS";
@@ -3101,6 +3115,17 @@ mod tests {
         self,
         time::{interval, interval_at, sleep, Duration, Instant, Interval},
     };
+
+    #[cfg(feature = "gdesk")]
+    #[test]
+    fn gdesk_virtual_interfaces_follow_physical_candidates_stably() {
+        let mut names = ["docker0", "enp3s0", "WSL", "wlan0", "vEthernet (WSL)",
+            "ZeroTier One", "tailscale0", "utun3", "tun0", "Ethernet", "Wi-Fi"];
+        names.sort_by_key(|name| is_virtual_interface_name(name));
+        assert_eq!(&names[..4], &["enp3s0", "wlan0", "Ethernet", "Wi-Fi"]);
+        assert_eq!(&names[4..], &["docker0", "WSL", "vEthernet (WSL)", "ZeroTier One", "tailscale0", "utun3", "tun0"]);
+        assert!(!is_virtual_interface_name("Realtek PCIe GbE Family Controller"));
+    }
 
     #[test]
     fn relay_uuid_rejects_control_bytes_but_not_other_id_formats() {

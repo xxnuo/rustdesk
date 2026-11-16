@@ -16,6 +16,11 @@ pub struct GDeskConfig {
     pub refine_min_still_frames: u8,
     pub max_refine_tiles_per_frame: usize,
     pub require_confirmed_cache_slots: bool,
+    /// UDP mode only: how many times every datagram of a frame is emitted (round-robin, so the
+    /// copies are separated by the rest of the frame).
+    pub udp_redundancy_factor: u8,
+    /// UDP mode only: how many times every refinement or retransmission datagram is emitted.
+    pub udp_refine_redundancy_factor: u8,
 }
 impl Default for GDeskConfig {
     fn default() -> Self {
@@ -25,6 +30,8 @@ impl Default for GDeskConfig {
             refine_min_still_frames: 2,
             max_refine_tiles_per_frame: protocol::MAX_TILES,
             require_confirmed_cache_slots: false,
+            udp_redundancy_factor: 1,
+            udp_refine_redundancy_factor: 1,
         }
     }
 }
@@ -44,13 +51,14 @@ pub struct GDeskEncoder {
     pub states: TileStateTable,
     pub cache: DeterministicLruCache,
     pub stats: GDeskStats,
-    width: u16,
-    height: u16,
-    canvas_epoch: u16,
-    frame_seq: u32,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) canvas_epoch: u16,
+    pub(crate) frame_seq: u32,
     reset_pending: bool,
     keep_cache_pending: bool,
-    last_capture_ts_us: u64,
+    pub(crate) last_capture_ts_us: u64,
+    pub udp: crate::udp::UdpEncoderState,
 }
 impl GDeskEncoder {
     pub fn new(width: u16, height: u16, config: GDeskConfig) -> Result<Self> {
@@ -67,6 +75,7 @@ impl GDeskEncoder {
             reset_pending: true,
             keep_cache_pending: false,
             last_capture_ts_us: 0,
+            udp: Default::default(),
         })
     }
     pub fn dimensions(&self) -> (u16, u16) {
@@ -81,6 +90,7 @@ impl GDeskEncoder {
         self.cache.clear();
         self.reset_pending = true;
         self.keep_cache_pending = false;
+        self.udp = Default::default();
         Ok(())
     }
     /// Switches resolution without dropping the block cache, so tiles the peer already holds come
