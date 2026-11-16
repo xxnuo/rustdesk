@@ -39,6 +39,8 @@ cfg_if! {
 }
 
 pub mod codec;
+#[cfg(feature = "gdesk")]
+pub mod gdesk_codec;
 pub mod convert;
 #[cfg(feature = "hwcodec")]
 pub mod hwcodec;
@@ -304,6 +306,8 @@ pub enum CodecFormat {
     AV1,
     H264,
     H265,
+    #[cfg(feature = "gdesk")]
+    GDesk,
     Unknown,
 }
 
@@ -315,6 +319,8 @@ impl From<&VideoFrame> for CodecFormat {
             Some(video_frame::Union::Av1s(_)) => CodecFormat::AV1,
             Some(video_frame::Union::H264s(_)) => CodecFormat::H264,
             Some(video_frame::Union::H265s(_)) => CodecFormat::H265,
+            #[cfg(feature = "gdesk")]
+            Some(video_frame::Union::Gdesks(_)) => CodecFormat::GDesk,
             _ => CodecFormat::Unknown,
         }
     }
@@ -328,6 +334,8 @@ impl From<&video_frame::Union> for CodecFormat {
             video_frame::Union::Av1s(_) => CodecFormat::AV1,
             video_frame::Union::H264s(_) => CodecFormat::H264,
             video_frame::Union::H265s(_) => CodecFormat::H265,
+            #[cfg(feature = "gdesk")]
+            video_frame::Union::Gdesks(_) => CodecFormat::GDesk,
             _ => CodecFormat::Unknown,
         }
     }
@@ -353,6 +361,8 @@ impl ToString for CodecFormat {
             CodecFormat::AV1 => "AV1".into(),
             CodecFormat::H264 => "H264".into(),
             CodecFormat::H265 => "H265".into(),
+            #[cfg(feature = "gdesk")]
+            CodecFormat::GDesk => "GDesk".into(),
             CodecFormat::Unknown => "Unknown".into(),
         }
     }

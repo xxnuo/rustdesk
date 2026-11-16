@@ -55,6 +55,8 @@ pub enum EncoderCfg {
     HWRAM(HwRamEncoderConfig),
     #[cfg(feature = "vram")]
     VRAM(VRamEncoderConfig),
+    #[cfg(feature = "gdesk")]
+    GDesk(crate::gdesk_codec::GDeskEncoderConfig),
 }
 
 pub trait EncoderApi {
@@ -80,6 +82,16 @@ pub trait EncoderApi {
     fn is_hardware(&self) -> bool;
 
     fn disable(&self);
+
+    #[cfg(feature = "gdesk")]
+    fn poll_refinement(&mut self, _ms: i64) -> ResultType<Option<VideoFrame>> {
+        Ok(None)
+    }
+
+    #[cfg(feature = "gdesk")]
+    fn is_gdesk(&self) -> bool {
+        false
+    }
 }
 
 pub struct Encoder {
@@ -116,6 +128,8 @@ pub struct Decoder {
     h264_media_codec: MediaCodecDecoder,
     #[cfg(feature = "mediacodec")]
     h265_media_codec: MediaCodecDecoder,
+    #[cfg(feature = "gdesk")]
+    gdesk: Option<gdesk::GDeskDecoder>,
     format: CodecFormat,
     valid: bool,
     #[cfg(feature = "hwcodec")]
@@ -139,6 +153,10 @@ impl Encoder {
             }),
             EncoderCfg::AOM(_) => Ok(Encoder {
                 codec: Box::new(AomEncoder::new(config, i444)?),
+            }),
+            #[cfg(feature = "gdesk")]
+            EncoderCfg::GDesk(_) => Ok(Encoder {
+                codec: Box::new(crate::gdesk_codec::GDeskEncoderApi::new(config, i444)?),
             }),
 
             #[cfg(feature = "hwcodec")]
@@ -198,6 +216,9 @@ impl Encoder {
             decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_h264 > 0);
         let _all_support_h265_decoding =
             decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_h265 > 0);
+        #[cfg(feature = "gdesk")]
+        let gdesk_useable =
+            decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_gdesk > 0);
         #[allow(unused_mut)]
         let mut h264vram_encoding = false;
         #[allow(unused_mut)]
@@ -243,16 +264,30 @@ impl Encoder {
                     || s.prefer == PreferCodec::AV1.into() && av1_useable
                     || s.prefer == PreferCodec::H264.into() && h264_useable
                     || s.prefer == PreferCodec::H265.into() && h265_useable
+                    || {
+                        #[cfg(feature = "gdesk")]
+                        let gdesk_preferred =
+                            s.prefer == PreferCodec::GDesk.into() && gdesk_useable;
+                        #[cfg(not(feature = "gdesk"))]
+                        let gdesk_preferred = false;
+                        gdesk_preferred
+                    }
             })
             .map(|(_, s)| s.prefer)
             .collect();
-        *USABLE_ENCODING.lock().unwrap() = Some(SupportedEncoding {
+        #[allow(unused_mut)]
+        let mut usable = SupportedEncoding {
             vp8: vp8_useable,
             av1: av1_useable,
             h264: h264_useable,
             h265: h265_useable,
             ..Default::default()
-        });
+        };
+        #[cfg(feature = "gdesk")]
+        {
+            usable.gdesk = gdesk_useable;
+        }
+        *USABLE_ENCODING.lock().unwrap() = Some(usable);
         // find the most frequent preference
         let mut counts = Vec::new();
         for pref in &preferences {
@@ -309,6 +344,16 @@ impl Encoder {
                 }
             }
             PreferCodec::Auto => auto_codec,
+            #[cfg(feature = "gdesk")]
+            PreferCodec::GDesk => {
+                if gdesk_useable {
+                    CodecFormat::GDesk
+                } else {
+                    auto_codec
+                }
+            }
+            #[cfg(not(feature = "gdesk"))]
+            PreferCodec::GDesk => auto_codec,
         };
         if decodings.len() > 0 {
             log::info!(
@@ -341,6 +386,10 @@ impl Encoder {
             .into(),
             ..Default::default()
         };
+        #[cfg(feature = "gdesk")]
+        {
+            encoding.gdesk = true;
+        }
         #[cfg(feature = "hwcodec")]
         if enable_hwcodec_option() {
             encoding.h264 |= HwRamEncoder::try_get(CodecFormat::H264).is_some();
@@ -365,6 +414,8 @@ impl Encoder {
                 VpxVideoCodecId::VP9 => CodecFormat::VP9,
             },
             EncoderCfg::AOM(_) => CodecFormat::AV1,
+            #[cfg(feature = "gdesk")]
+            EncoderCfg::GDesk(_) => CodecFormat::GDesk,
             #[cfg(feature = "hwcodec")]
             EncoderCfg::HWRAM(hw) => {
                 let name = hw.name.to_lowercase();
@@ -411,6 +462,8 @@ impl Encoder {
                 VpxVideoCodecId::VP9 => decodings.iter().all(|d| d.1.i444.vp9),
             },
             EncoderCfg::AOM(_) => decodings.iter().all(|d| d.1.i444.av1),
+            #[cfg(feature = "gdesk")]
+            EncoderCfg::GDesk(_) => false,
             #[cfg(feature = "hwcodec")]
             EncoderCfg::HWRAM(_) => false,
             #[cfg(feature = "vram")]
@@ -444,6 +497,10 @@ impl Decoder {
             prefer_chroma: prefer_chroma.into(),
             ..Default::default()
         };
+        #[cfg(feature = "gdesk")]
+        {
+            decoding.ability_gdesk = 1;
+        }
         #[cfg(feature = "hwcodec")]
         {
             decoding.ability_h264 |= if HwRamDecoder::try_get(CodecFormat::H264).is_some() {
@@ -492,6 +549,8 @@ impl Decoder {
                 CodecFormat::AV1 => decoding.ability_av1 = 0,
                 CodecFormat::H264 => decoding.ability_h264 = 0,
                 CodecFormat::H265 => decoding.ability_h265 = 0,
+                #[cfg(feature = "gdesk")]
+                CodecFormat::GDesk => decoding.ability_gdesk = 0,
                 _ => {}
             }
         }
@@ -507,9 +566,16 @@ impl Decoder {
         let (mut h264_vram, mut h265_vram) = (None, None);
         #[cfg(feature = "mediacodec")]
         let (mut h264_media_codec, mut h265_media_codec) = (None, None);
+        #[cfg(feature = "gdesk")]
+        let mut gdesk = None;
         let mut valid = false;
 
         match format {
+            #[cfg(feature = "gdesk")]
+            CodecFormat::GDesk => {
+                gdesk = Some(gdesk::GDeskDecoder::new());
+                valid = true;
+            }
             CodecFormat::VP8 => {
                 match VpxDecoder::new(VpxDecoderConfig {
                     codec: VpxVideoCodecId::VP8,
@@ -612,6 +678,8 @@ impl Decoder {
             h264_media_codec,
             #[cfg(feature = "mediacodec")]
             h265_media_codec,
+            #[cfg(feature = "gdesk")]
+            gdesk,
             format,
             valid,
             #[cfg(feature = "hwcodec")]
@@ -656,6 +724,15 @@ impl Decoder {
                     Decoder::handle_av1s_video_frame(av1, av1s, rgb, chroma)
                 } else {
                     bail!("av1 decoder not available");
+                }
+            }
+            #[cfg(feature = "gdesk")]
+            video_frame::Union::Gdesks(gdesks) => {
+                *chroma = Some(Chroma::I444);
+                if let Some(decoder) = &mut self.gdesk {
+                    crate::gdesk_codec::decode_into(decoder, gdesks, rgb)
+                } else {
+                    bail!("gdesk decoder not available");
                 }
             }
             #[cfg(any(feature = "hwcodec", feature = "vram"))]
@@ -835,6 +912,8 @@ impl Decoder {
             PreferCodec::H264
         } else if codec == "h265" {
             PreferCodec::H265
+        } else if cfg!(feature = "gdesk") && codec == "gdesk" {
+            PreferCodec::GDesk
         } else {
             PreferCodec::Auto
         };

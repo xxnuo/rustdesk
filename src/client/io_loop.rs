@@ -1531,6 +1531,8 @@ impl<T: InvokeUiSession> Remote<T> {
         match &vf.union {
             Some(vf) => match vf {
                 Vp8s(f) | Vp9s(f) | Av1s(f) | H264s(f) | H265s(f) => f.frames.iter().any(|e| e.key),
+                #[cfg(feature = "gdesk")]
+                Gdesks(f) => f.frames.iter().any(|e| e.key),
                 _ => false,
             },
             None => false,

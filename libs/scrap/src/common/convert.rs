@@ -32,6 +32,51 @@ pub fn convert_to_yuv(
             dst_fmt.h
         );
     }
+    #[cfg(feature = "gdesk")]
+    if matches!(src_pixfmt, crate::Pixfmt::BGRA | crate::Pixfmt::RGBA)
+        && matches!(dst_fmt.pixfmt, crate::Pixfmt::BGRA | crate::Pixfmt::RGBA)
+    {
+        let row = src_width
+            .checked_mul(4)
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("row size overflow"))?;
+        let source_stride = *src_stride
+            .first()
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("missing source stride"))?;
+        if source_stride < row {
+            bail!("source stride too small: {source_stride} < {row}");
+        }
+        let dst_stride = *dst_fmt
+            .stride
+            .first()
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("missing destination stride"))?;
+        if dst_stride < row {
+            bail!("destination stride too small: {dst_stride} < {row}");
+        }
+        let dst_len = dst_stride
+            .checked_mul(src_height)
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("destination size overflow"))?;
+        dst.resize(dst_len, 0);
+        for y in 0..src_height {
+            let src_at = y
+                .checked_mul(source_stride)
+                .ok_or_else(|| hbb_common::anyhow::anyhow!("source offset overflow"))?;
+            let src_end = src_at
+                .checked_add(row)
+                .ok_or_else(|| hbb_common::anyhow::anyhow!("source size overflow"))?;
+            let src_row = src
+                .get(src_at..src_end)
+                .ok_or_else(|| hbb_common::anyhow::anyhow!("source row out of bounds"))?;
+            let dst_row = &mut dst[y * dst_stride..y * dst_stride + row];
+            dst_row.copy_from_slice(src_row);
+            if src_pixfmt != dst_fmt.pixfmt {
+                for pixel in dst_row.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+            }
+        }
+        return Ok(());
+    }
+
     if src_pixfmt == crate::Pixfmt::BGRA
         || src_pixfmt == crate::Pixfmt::RGBA
         || src_pixfmt == crate::Pixfmt::RGB565LE

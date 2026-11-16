@@ -144,8 +144,10 @@ fn gate3_alt_tab_4k_cache_instant_switch() {
     assert_eq!(err, 0);
 }
 
+#[cfg(feature = "gpu")]
 #[test]
 fn gate4_gpu_1080p_benchmark() {
+    #[cfg(feature = "gpu")]
     use gdesk::{
         gpu::{GpuContext, GpuDecoder, GpuEncoder},
         math,

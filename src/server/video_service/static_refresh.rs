@@ -50,6 +50,8 @@ fn max_repeat_frames(codec: CodecFormat, quality: f32, backend: HardwareBackend)
         (CodecFormat::H264, _) => (90, 60, 60, 30),
         (CodecFormat::H265, _) => (90, 60, 60, 30),
         (CodecFormat::AV1 | CodecFormat::Unknown, _) => return 0,
+        #[cfg(feature = "gdesk")]
+        (CodecFormat::GDesk, _) => return 0,
     };
     if quality >= BR_BEST {
         best
@@ -194,6 +196,10 @@ impl<'a> StaticRefresh<'a> {
             quality,
             self.hardware_backend,
         ));
+        #[cfg(feature = "gdesk")]
+        if self.codec_format == CodecFormat::GDesk {
+            return Ok(());
+        }
         if !self.source.is_monitor()
             || self.codec_format == CodecFormat::AV1
             || !self.source_ready

@@ -953,6 +953,22 @@ fn run(vs: VideoService) -> ResultType<()> {
                         send_counter += 1;
                     }
                 }
+                #[cfg(feature = "gdesk")]
+                if encoder.is_gdesk() {
+                    let send_conn_ids = handle_gdesk_refinement(
+                        display_idx,
+                        &sp,
+                        &mut encoder,
+                        recorder.clone(),
+                        ms,
+                        capture_width,
+                        capture_height,
+                    )?;
+                    if !send_conn_ids.is_empty() {
+                        frame_controller.set_send(now, send_conn_ids);
+                        send_counter += 1;
+                    }
+                }
                 static_refresh.try_encode(
                     &yuv,
                     spf,
@@ -1157,6 +1173,11 @@ fn get_encoder_config(
             },
             keyframe_interval,
         }),
+        #[cfg(feature = "gdesk")]
+        CodecFormat::GDesk => EncoderCfg::GDesk(scrap::gdesk_codec::GDeskEncoderConfig {
+            width: c.width,
+            height: c.height,
+        }),
         CodecFormat::AV1 => EncoderCfg::AOM(AomEncoderConfig {
             width: c.width as _,
             height: c.height as _,
@@ -1315,6 +1336,13 @@ fn handle_one_frame(
             send_conn_ids = sp.send_video_frame(msg);
         }
         Err(e) => {
+            #[cfg(feature = "gdesk")]
+            if e.is::<scrap::gdesk_codec::GDeskNoOutput>() {
+                return Ok(static_refresh::FrameEncodeResult {
+                    send_conn_ids,
+                    vpx_no_output: false,
+                });
+            }
             vpx_no_output = e.is::<scrap::VpxNoOutput>();
             *encode_fail_counter += 1;
             // Encoding errors are not frequent except on Android
@@ -1350,6 +1378,30 @@ fn handle_one_frame(
         send_conn_ids,
         vpx_no_output,
     })
+}
+
+#[cfg(feature = "gdesk")]
+fn handle_gdesk_refinement(
+    display: usize,
+    sp: &GenericService,
+    encoder: &mut Encoder,
+    recorder: Arc<Mutex<Option<Recorder>>>,
+    ms: i64,
+    width: usize,
+    height: usize,
+) -> ResultType<HashSet<i32>> {
+    let Some(mut vf) = encoder.poll_refinement(ms)? else {
+        return Ok(Default::default());
+    };
+    vf.display = display as _;
+    let mut msg = Message::new();
+    msg.set_video_frame(vf);
+    recorder
+        .lock()
+        .unwrap()
+        .as_mut()
+        .map(|r| r.write_message(&msg, width, height));
+    Ok(sp.send_video_frame(msg))
 }
 
 #[inline]

@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod decoder;
 pub mod encoder;
+#[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod math;
 pub mod protocol;
