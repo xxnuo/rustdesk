@@ -690,6 +690,14 @@ fn run(vs: VideoService) -> ResultType<()> {
             )?
         }
     };
+    #[cfg(feature = "gdesk")]
+    let _gdesk_font_smoothing = if encoder.is_gdesk() && vs.source.is_monitor() {
+        crate::platform::GDeskFontSmoothingGuard::new()
+            .map_err(|err| log::warn!("Failed to enable grayscale font smoothing: {err}"))
+            .ok()
+    } else {
+        None
+    };
     #[cfg(feature = "vram")]
     c.set_output_texture(encoder.input_texture());
     #[cfg(target_os = "android")]
@@ -733,8 +741,10 @@ fn run(vs: VideoService) -> ResultType<()> {
     let mut first_frame = true;
     // Set once the encoder emits its first packet; until then it may legitimately return nothing.
     let mut encoder_warmed_up = false;
-    let capture_width = c.width;
-    let capture_height = c.height;
+    #[allow(unused_mut)]
+    let mut capture_width = c.width;
+    #[allow(unused_mut)]
+    let mut capture_height = c.height;
     let mut static_refresh = static_refresh::StaticRefresh::new(
         vs.source,
         codec_format,
@@ -779,6 +789,17 @@ fn run(vs: VideoService) -> ResultType<()> {
                 std::thread::sleep(spf);
                 continue;
             }
+        }
+        #[cfg(feature = "gdesk")]
+        if encoder.is_gdesk() && vs.source.is_monitor()
+            && gdesk_display_changed(&sp, display_idx, &c, sp.is_option_true(OPTION_REFRESH))?
+        {
+            gdesk_recreate_capture(&mut c, &mut encoder, vs.source, display_idx, last_portable_service_running)?;
+            capture_width = c.width;
+            capture_height = c.height;
+            first_frame = true;
+            yuv.clear();
+            sp.set_option_bool(OPTION_REFRESH, false);
         }
         // On macOS, a refresh here would destroy a hardware encoder that has been fed a frame but
         // not yet produced its first packet, restarting the warm-up forever. Defer until it has;
@@ -889,6 +910,17 @@ fn run(vs: VideoService) -> ResultType<()> {
                         }
                     }
 
+                    #[cfg(feature = "gdesk")]
+                    if encoder.is_gdesk() {
+                        if let scrap::Frame::PixelBuffer(pixels) = &frame {
+                            if (pixels.width(), pixels.height()) != (capture_width, capture_height) {
+                                encoder.resize_gdesk(pixels.width(), pixels.height())?;
+                                capture_width = pixels.width();
+                                capture_height = pixels.height();
+                                first_frame = true;
+                            }
+                        }
+                    }
                     let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
                     static_refresh.on_frame(&frame);
                     let result = handle_one_frame(
@@ -1010,6 +1042,17 @@ fn run(vs: VideoService) -> ResultType<()> {
                 } else {
                     None
                 };
+                #[cfg(feature = "gdesk")]
+                if encoder.is_gdesk() && vs.source.is_monitor()
+                    && gdesk_display_changed(&sp, display_idx, &c, true)?
+                {
+                    gdesk_recreate_capture(&mut c, &mut encoder, vs.source, display_idx, last_portable_service_running)?;
+                    capture_width = c.width;
+                    capture_height = c.height;
+                    first_frame = true;
+                    yuv.clear();
+                    continue;
+                }
                 // This check may be redundant, but it is better to be safe.
                 // The previous check in `sp.is_option_true(OPTION_REFRESH)` block may be enough.
                 if vs.source.is_monitor() {
@@ -1462,6 +1505,48 @@ fn start_uac_elevation_check() {
     });
 }
 
+#[cfg(feature = "gdesk")]
+fn gdesk_recreate_capture(
+    capture: &mut CapturerInfo,
+    encoder: &mut Encoder,
+    source: VideoSource,
+    display_idx: usize,
+    portable_service_running: bool,
+) -> ResultType<()> {
+    #[allow(unused_mut)]
+    let mut replacement = get_capturer(source, display_idx, portable_service_running)?;
+    #[cfg(windows)]
+    if !scrap::codec::enable_directx_capture() && !replacement.is_gdi() {
+        log::info!("disable dxgi with option, fall back to gdi");
+        replacement.set_gdi();
+    }
+    encoder.resize_gdesk(replacement.width, replacement.height)?;
+    *capture = replacement;
+    Ok(())
+}
+
+#[cfg(feature = "gdesk")]
+fn gdesk_display_changed(
+    sp: &GenericService,
+    display_idx: usize,
+    cap: &CapturerInfo,
+    refresh: bool,
+) -> ResultType<bool> {
+    // A new viewer has no cache; it still needs the existing full encoder restart.
+    sp.snapshot(|sps| {
+        if sps.has_subscribes() {
+            bail!("SWITCH");
+        }
+        Ok(())
+    })?;
+    // A changed canvas recreates capture while keeping the encoder and font guard alive.
+    match try_broadcast_display_changed(sp, display_idx, cap, refresh) {
+        Ok(()) => Ok(false),
+        Err(err) if err.to_string() == "SWITCH" => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
 #[inline]
 fn try_broadcast_display_changed(
     sp: &GenericService,
@@ -1660,6 +1745,26 @@ fn handle_screenshot(screenshot: Screenshot, msg: String, w: usize, h: usize, da
 #[cfg(test)]
 mod tests {
     use super::refresh_allowed;
+
+    #[cfg(feature = "gdesk")]
+    #[test]
+    fn gdesk_encoder_resize_hook_keeps_cached_tiles() {
+        let mut encoder = super::Encoder::new(super::EncoderCfg::GDesk(
+            scrap::gdesk_codec::GDeskEncoderConfig { width: 64, height: 64 }
+        ), false).unwrap();
+        let pixels: Vec<u8> = (0..64 * 64).flat_map(|i| {
+            if (i % 64 + i / 64) % 2 == 0 { [19, 41, 83, 255] }
+            else { [97, 53, 29, 255] }
+        }).collect();
+        encoder.encode_to_message(scrap::EncodeInput::YUV(&pixels), 1).unwrap();
+        encoder.resize_gdesk(128, 64).unwrap();
+        let expanded: Vec<u8> = pixels.chunks_exact(64 * 4).flat_map(|row| row.iter().chain(row).copied()).collect();
+        let frame = encoder.encode_to_message(scrap::EncodeInput::YUV(&expanded), 2).unwrap();
+        let (header, records) = gdesk::protocol::decode_frame(&frame.gdesks().frames[0].data).unwrap();
+        assert_eq!((header.width, header.height), (128, 64));
+        assert_ne!(header.frame_flags & gdesk::protocol::CACHE_KEEP, 0);
+        assert!(records.iter().all(|r| matches!(r, gdesk::protocol::TileRecord::CacheHit { .. })));
+    }
 
     #[test]
     fn refresh_waits_for_hw_encoder_warmup() {

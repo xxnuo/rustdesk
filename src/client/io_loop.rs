@@ -1362,12 +1362,20 @@ impl<T: InvokeUiSession> Remote<T> {
             Data::ResetDecoder(display) => match display {
                 Some(display) => {
                     if let Some(v) = self.video_threads.get_mut(&display) {
-                        v.video_sender.send(MediaData::Reset).ok();
+                        #[cfg(feature = "gdesk")]
+                        let reset = MediaData::ResetDecoder;
+                        #[cfg(not(feature = "gdesk"))]
+                        let reset = MediaData::Reset;
+                        v.video_sender.send(reset).ok();
                     }
                 }
                 None => {
                     for (_, v) in self.video_threads.iter_mut() {
-                        v.video_sender.send(MediaData::Reset).ok();
+                        #[cfg(feature = "gdesk")]
+                        let reset = MediaData::ResetDecoder;
+                        #[cfg(not(feature = "gdesk"))]
+                        let reset = MediaData::Reset;
+                        v.video_sender.send(reset).ok();
                     }
                 }
             },

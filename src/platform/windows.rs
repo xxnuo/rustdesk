@@ -4230,6 +4230,71 @@ fn get_license() -> Option<CustomServer> {
     Some(lic)
 }
 
+#[cfg(feature = "gdesk")]
+static GDESK_FONT_SMOOTHING: Mutex<(usize, Option<u32>)> = Mutex::new((0, None));
+
+#[cfg(feature = "gdesk")]
+#[must_use]
+pub struct GDeskFontSmoothingGuard {
+    _private: (),
+}
+
+#[cfg(feature = "gdesk")]
+impl GDeskFontSmoothingGuard {
+    pub fn new() -> ResultType<Self> {
+        let mut state = GDESK_FONT_SMOOTHING.lock().unwrap();
+        if state.0 == 0 {
+            let mut original = 0u32;
+            if unsafe {
+                SystemParametersInfoW(
+                    SPI_GETFONTSMOOTHINGTYPE,
+                    0,
+                    &mut original as *mut u32 as _,
+                    0,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error().into());
+            }
+            Self::set_smoothing_type(FE_FONTSMOOTHINGSTANDARD)?;
+            state.1 = Some(original);
+        }
+        state.0 += 1;
+        Ok(Self { _private: () })
+    }
+
+    fn set_smoothing_type(value: u32) -> ResultType<()> {
+        // Broadcast the temporary setting without persisting it to the user's profile.
+        if unsafe {
+            SystemParametersInfoW(
+                SPI_SETFONTSMOOTHINGTYPE,
+                0,
+                value as usize as _,
+                SPIF_SENDCHANGE,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "gdesk")]
+impl Drop for GDeskFontSmoothingGuard {
+    fn drop(&mut self) {
+        let mut state = GDESK_FONT_SMOOTHING.lock().unwrap();
+        state.0 -= 1;
+        if state.0 == 0 {
+            if let Some(original) = state.1.take() {
+                if let Err(err) = Self::set_smoothing_type(original) {
+                    log::warn!("Failed to restore font smoothing: {err}");
+                }
+            }
+        }
+    }
+}
+
 pub struct WallPaperRemover {
     old_path: String,
 }

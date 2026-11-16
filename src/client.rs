@@ -2740,6 +2740,11 @@ impl VideoHandler {
 
     /// Reset the decoder, change format if it is Some
     pub fn reset(&mut self, format: Option<CodecFormat>) {
+        #[cfg(feature = "gdesk")]
+        if format.is_none() && self.decoder.format() == CodecFormat::GDesk {
+            // SwitchDisplay precedes a canvas reset that can still reference the current cache.
+            return;
+        }
         log::info!(
             "reset video handler for display #{}, format: {format:?}",
             self._display
@@ -2771,6 +2776,113 @@ impl VideoHandler {
         }
 
         self.record = start;
+    }
+}
+
+#[cfg(all(test, feature = "gdesk"))]
+mod gdesk_video_tests {
+    use super::*;
+
+    fn video_frame(packet: Vec<u8>) -> VideoFrame {
+        let mut frames = EncodedVideoFrames::new();
+        frames.frames.push(EncodedVideoFrame {
+            data: packet.into(),
+            key: true,
+            ..Default::default()
+        });
+        let mut frame = VideoFrame::new();
+        frame.set_gdesks(frames);
+        frame
+    }
+
+    #[test]
+    fn seamless_resize_reuses_cached_tiles_and_keeps_previous_image_on_failure() {
+        let mut encoder = gdesk::GDeskEncoder::new(64, 64, Default::default()).unwrap();
+        let mut handler = VideoHandler::new(CodecFormat::GDesk, 0);
+        let mut pixelbuffer = true;
+        let mut chroma = None;
+        for (width, height) in [(64, 64), (128, 64)] {
+            let rgb: Vec<u8> = (0..width as usize * height as usize)
+                .flat_map(|i| {
+                    if (i % width as usize + i / width as usize) % 2 == 0 {
+                        [19, 41, 83]
+                    } else {
+                        [97, 53, 29]
+                    }
+                })
+                .collect();
+            if width != 64 {
+                encoder.resize_seamless(width, height).unwrap();
+                handler.reset(None);
+                assert_eq!((handler.rgb.w, handler.rgb.h), (64, 64));
+            }
+            let packet = encoder
+                .encode_frame(&rgb, width as usize * 3, gdesk::PixelFormat::Rgb, 1)
+                .unwrap()
+                .unwrap();
+            if width != 64 {
+                let (header, records) = gdesk::protocol::decode_frame(&packet).unwrap();
+                assert_ne!(header.frame_flags & gdesk::protocol::KEYFRAME_RESET, 0);
+                assert_ne!(header.frame_flags & gdesk::protocol::CACHE_KEEP, 0);
+                assert!(records
+                    .iter()
+                    .all(|r| matches!(r, gdesk::protocol::TileRecord::CacheHit { .. })));
+                let previous_rgb = handler.rgb.raw.clone();
+                assert!(handler
+                    .handle_frame(
+                        video_frame(packet[..packet.len() - 1].to_vec()),
+                        &mut pixelbuffer,
+                        &mut chroma
+                    )
+                    .is_err());
+                assert_eq!((handler.rgb.w, handler.rgb.h), (64, 64));
+                assert_eq!(handler.rgb.raw, previous_rgb);
+            }
+            assert!(handler
+                .handle_frame(video_frame(packet), &mut pixelbuffer, &mut chroma)
+                .unwrap());
+            assert_eq!(
+                (handler.rgb.w, handler.rgb.h),
+                (width as usize, height as usize)
+            );
+            let bpp = 4;
+            let stride = (width as usize * bpp + handler.rgb.align.max(1) - 1)
+                / handler.rgb.align.max(1)
+                * handler.rgb.align.max(1);
+            for y in 0..height as usize {
+                for x in 0..width as usize {
+                    let p = &rgb[(y * width as usize + x) * 3..][..3];
+                    let expected = match handler.rgb.fmt {
+                        ImageFormat::ARGB => [p[2], p[1], p[0], 255],
+                        _ => [p[0], p[1], p[2], 255],
+                    };
+                    assert_eq!(&handler.rgb.raw[y * stride + x * bpp..][..bpp], &expected);
+                }
+            }
+            assert!(handler.decoder.valid());
+            assert_eq!(handler.fail_counter, 0);
+        }
+        handler.reset(Some(CodecFormat::GDesk));
+        encoder.resize_seamless(64, 64).unwrap();
+        let rgb: Vec<u8> = (0..64 * 64)
+            .flat_map(|i| {
+                if (i % 64 + i / 64) % 2 == 0 {
+                    [19, 41, 83]
+                } else {
+                    [97, 53, 29]
+                }
+            })
+            .collect();
+        let cached = encoder
+            .encode_frame(&rgb, 64 * 3, gdesk::PixelFormat::Rgb, 2)
+            .unwrap()
+            .unwrap();
+        assert!(
+            handler
+                .handle_frame(video_frame(cached), &mut pixelbuffer, &mut chroma)
+                .is_err(),
+            "explicit recovery must discard the previous cache"
+        );
     }
 }
 
@@ -3980,6 +4092,8 @@ pub enum MediaData {
     AudioFrame(Box<AudioFrame>),
     AudioFormat(AudioFormat),
     Reset,
+    #[cfg(feature = "gdesk")]
+    ResetDecoder,
     RecordScreen(bool),
 }
 
@@ -4124,6 +4238,12 @@ pub fn start_video_thread<F, T>(
                     MediaData::Reset => {
                         if let Some(handler) = video_handler.as_mut() {
                             handler.reset(None);
+                        }
+                    }
+                    #[cfg(feature = "gdesk")]
+                    MediaData::ResetDecoder => {
+                        if let Some(handler) = video_handler.as_mut() {
+                            handler.reset(Some(handler.decoder.format()));
                         }
                     }
                     MediaData::RecordScreen(start) => {

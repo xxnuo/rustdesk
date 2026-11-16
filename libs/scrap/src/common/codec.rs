@@ -97,6 +97,11 @@ pub trait EncoderApi {
     }
 
     #[cfg(feature = "gdesk")]
+    fn resize_gdesk(&mut self, _width: usize, _height: usize) -> ResultType<()> {
+        bail!("encoder does not support GDesk canvas resizing");
+    }
+
+    #[cfg(feature = "gdesk")]
     fn is_gdesk(&self) -> bool {
         false
     }

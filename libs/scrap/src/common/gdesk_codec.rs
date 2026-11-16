@@ -24,6 +24,25 @@ impl std::fmt::Display for GDeskNoOutput {
 
 impl std::error::Error for GDeskNoOutput {}
 
+impl GDeskEncoderApi {
+    pub fn resize_seamless(
+        &mut self,
+        width: usize,
+        height: usize,
+        format: Pixfmt,
+    ) -> ResultType<()> {
+        if !matches!(format, Pixfmt::BGRA) {
+            bail!("gdesk encoder only accepts BGRA frames");
+        }
+        self.inner
+            .resize_seamless(u16::try_from(width)?, u16::try_from(height)?)
+            .map_err(|e| anyhow!("gdesk resize failed: {e}"))?;
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GDeskEncoderConfig {
     pub width: usize,
@@ -111,6 +130,10 @@ impl EncoderApi for GDeskEncoderApi {
 
     fn has_gdesk_pending_refinement(&self) -> bool {
         self.inner.has_pending_refinement()
+    }
+
+    fn resize_gdesk(&mut self, width: usize, height: usize) -> ResultType<()> {
+        self.resize_seamless(width, height, Pixfmt::BGRA)
     }
 
     fn is_gdesk(&self) -> bool {

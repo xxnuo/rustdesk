@@ -260,3 +260,76 @@ fn present(@builtin(global_invocation_id) gid: vec3<u32>) {
     let out = vec3<u32>(clamp(color + vec3<f32>(0.5), vec3<f32>(0.0), vec3<f32>(255.0)));
     display[gid.y * params.width + gid.x] = 0xFF000000u | out.x | (out.y << 8u) | (out.z << 16u);
 }
+
+struct ResampleParams {
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    sharpness: f32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+@group(0) @binding(13) var<storage, read_write> scaled: array<u32>;
+@group(0) @binding(14) var<uniform> rparams: ResampleParams;
+
+fn rs_load(x: i32, y: i32) -> vec3<f32> {
+    let cx = u32(clamp(x, 0, i32(rparams.src_w) - 1));
+    let cy = u32(clamp(y, 0, i32(rparams.src_h) - 1));
+    let px = canvas[cy * rparams.src_w + cx];
+    return vec3<f32>(f32(px & 255u), f32((px >> 8u) & 255u), f32((px >> 16u) & 255u)) * (1.0 / 255.0);
+}
+
+fn lanczos2(x: f32) -> f32 {
+    let ax = abs(x);
+    if ax < 1e-6 { return 1.0; }
+    if ax >= 2.0 { return 0.0; }
+    let px = 3.14159265358979 * ax;
+    return 2.0 * sin(px) * sin(px * 0.5) / (px * px);
+}
+
+fn rs_lanczos(dx: i32, dy: i32) -> vec3<f32> {
+    let scale = vec2<f32>(f32(rparams.src_w) / f32(rparams.dst_w), f32(rparams.src_h) / f32(rparams.dst_h));
+    let center = (vec2<f32>(f32(dx) + 0.5, f32(dy) + 0.5)) * scale - vec2<f32>(0.5);
+    let support = clamp(scale, vec2<f32>(1.0), vec2<f32>(8.0));
+    let x0 = i32(floor(center.x - 2.0 * support.x)) + 1;
+    let x1 = i32(floor(center.x + 2.0 * support.x));
+    let y0 = i32(floor(center.y - 2.0 * support.y)) + 1;
+    let y1 = i32(floor(center.y + 2.0 * support.y));
+    var acc = vec3<f32>(0.0);
+    var total = 0.0;
+    for (var y = y0; y <= y1; y++) {
+        let wy = lanczos2((f32(y) - center.y) / support.y);
+        for (var x = x0; x <= x1; x++) {
+            let weight = lanczos2((f32(x) - center.x) / support.x) * wy;
+            acc += weight * rs_load(x, y);
+            total += weight;
+        }
+    }
+    return acc / total;
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn resample_sharpen(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= rparams.dst_w || gid.y >= rparams.dst_h { return; }
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    let center = rs_lanczos(x, y);
+    var color = center;
+    if rparams.sharpness > 0.0 {
+        let north = rs_lanczos(x, max(y - 1, 0));
+        let south = rs_lanczos(x, min(y + 1, i32(rparams.dst_h) - 1));
+        let west = rs_lanczos(max(x - 1, 0), y);
+        let east = rs_lanczos(min(x + 1, i32(rparams.dst_w) - 1), y);
+        let low = min(min(min(north, south), min(west, east)), center);
+        let high = max(max(max(north, south), max(west, east)), center);
+        let amp = sqrt(clamp(min(low, vec3<f32>(1.0) - high) / max(high, vec3<f32>(1e-4)), vec3<f32>(0.0), vec3<f32>(1.0)));
+        let peak = -1.0 / mix(8.0, 5.0, clamp(rparams.sharpness, 0.0, 1.0));
+        let weight = amp * peak;
+        color = (weight * (north + south + west + east) + center) / (vec3<f32>(1.0) + 4.0 * weight);
+    }
+    let out = vec3<u32>(clamp(color * 255.0 + vec3<f32>(0.5), vec3<f32>(0.0), vec3<f32>(255.0)));
+    scaled[gid.y * rparams.dst_w + gid.x] = 0xFF000000u | out.x | (out.y << 8u) | (out.z << 16u);
+}

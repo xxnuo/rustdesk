@@ -1,7 +1,7 @@
 use crate::{
     cache::DeterministicLruCache,
     math::{self, PixelFormat, WaveletState},
-    protocol::{self, GDeskFrameHeader, TileRecord, KEYFRAME_RESET},
+    protocol::{self, GDeskFrameHeader, TileRecord, CACHE_KEEP, KEYFRAME_RESET},
     Error, Result,
 };
 
@@ -39,15 +39,27 @@ impl GDeskDecoder {
         let (header, records) = protocol::decode_frame(bytes)?;
         let reset = header.frame_flags & KEYFRAME_RESET != 0;
         let count = protocol::tile_count(header.width, header.height)?;
+        let mut previous_state = None;
         if reset {
+            if header.frame_flags & CACHE_KEEP != 0 && (self.needs_reset || self.last_header.is_none()) {
+                return Err(Error("cannot keep cache when decoder needs full reset"));
+            }
             if records.len() != count {
                 return Err(Error("reset must initialize every tile"));
             }
-            self.canvas = vec![0; header.width as usize * header.height as usize * 3];
-            self.rendered_canvas.clear();
-            self.cache.clear();
-            self.wavelets = vec![None; count];
-            self.lossless = vec![false; count];
+            // The previous canvas stays presentable until the new one is complete.
+            previous_state = Some((
+                std::mem::replace(
+                    &mut self.canvas,
+                    vec![0; header.width as usize * header.height as usize * 3],
+                ),
+                std::mem::take(&mut self.rendered_canvas),
+                std::mem::replace(&mut self.wavelets, vec![None; count]),
+                std::mem::replace(&mut self.lossless, vec![false; count]),
+            ));
+            if header.frame_flags & CACHE_KEEP == 0 {
+                self.cache.clear();
+            }
             self.needs_reset = false;
         } else {
             let previous = self
@@ -66,6 +78,17 @@ impl GDeskDecoder {
             if let Err(error) = self.apply_record(&header, record) {
                 // A partially applied malformed delta cannot be used as the next frame's base.
                 self.needs_reset = true;
+                self.cache.clear();
+                if let Some((canvas, rendered, wavelets, lossless)) = previous_state {
+                    self.canvas = canvas;
+                    self.rendered_canvas = if rendered.is_empty() {
+                        self.canvas.clone()
+                    } else {
+                        rendered
+                    };
+                    self.wavelets = wavelets;
+                    self.lossless = lossless;
+                }
                 return Err(error);
             }
         }
@@ -390,5 +413,52 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decoder.decode_frame(&packet).unwrap(), rgb);
+    }
+
+    #[test]
+    fn failed_keep_cache_reset_rolls_back_and_taints() {
+        let solid = |tile_index: u16, value: u8| TileRecord::SolidFill {
+            tile_index,
+            color: [value; 3],
+        };
+        let frame = |flags: u8, epoch: u16, seq: u32, records: Vec<TileRecord>| {
+            let header = GDeskFrameHeader {
+                width: 128,
+                height: 64,
+                canvas_epoch: epoch,
+                frame_seq: seq,
+                frame_flags: flags,
+                ..Default::default()
+            };
+            protocol::encode_frame(header, &records).unwrap()
+        };
+        let mut decoder = GDeskDecoder::new();
+        decoder
+            .decode_frame(&frame(KEYFRAME_RESET, 0, 0, vec![solid(0, 10), solid(1, 20)]))
+            .unwrap();
+        let before = decoder.canvas_rgb().to_vec();
+        assert!(decoder
+            .decode_frame(&frame(
+                KEYFRAME_RESET | CACHE_KEEP,
+                1,
+                1,
+                vec![
+                    solid(0, 30),
+                    TileRecord::WaveletRefine {
+                        tile_index: 1,
+                        shift_y: 0,
+                        shift_c: 0,
+                        payload: vec![1, 2, 3],
+                    },
+                ],
+            ))
+            .is_err());
+        assert_eq!(decoder.canvas_rgb(), &before[..]);
+        let keep = frame(KEYFRAME_RESET | CACHE_KEEP, 1, 2, vec![solid(0, 30), solid(1, 40)]);
+        assert!(decoder.decode_frame(&keep).is_err());
+        decoder
+            .decode_frame(&frame(KEYFRAME_RESET, 2, 3, vec![solid(0, 50), solid(1, 60)]))
+            .unwrap();
+        decoder.decode_frame(&keep).unwrap();
     }
 }

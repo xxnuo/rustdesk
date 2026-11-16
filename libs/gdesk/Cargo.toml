@@ -7,7 +7,7 @@ rust-version = "1.81"
 [dependencies]
 bytemuck = { version = "1.23", features = ["derive"] }
 xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
-lz4_flex = "0.11"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "checked-decode"] }
 wgpu = { version = "24", optional = true }
 pollster = { version = "0.4", optional = true }
 log = "0.4"
@@ -15,3 +15,6 @@ log = "0.4"
 [features]
 default = ["gpu"]
 gpu = ["dep:wgpu", "dep:pollster"]
+
+[dev-dependencies]
+libc = "0.2"

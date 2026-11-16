@@ -49,6 +49,7 @@ pub struct GDeskEncoder {
     canvas_epoch: u16,
     frame_seq: u32,
     reset_pending: bool,
+    keep_cache_pending: bool,
     last_capture_ts_us: u64,
 }
 impl GDeskEncoder {
@@ -64,6 +65,7 @@ impl GDeskEncoder {
             canvas_epoch: 0,
             frame_seq: 0,
             reset_pending: true,
+            keep_cache_pending: false,
             last_capture_ts_us: 0,
         })
     }
@@ -78,7 +80,23 @@ impl GDeskEncoder {
         self.states.reset(count);
         self.cache.clear();
         self.reset_pending = true;
+        self.keep_cache_pending = false;
         Ok(())
+    }
+    /// Switches resolution without dropping the block cache, so tiles the peer already holds come
+    /// back as CACHE_HIT references in the first frame of the new canvas.
+    pub fn resize_seamless(&mut self, width: u16, height: u16) -> Result<()> {
+        let count = protocol::tile_count(width, height)?;
+        self.width = width;
+        self.height = height;
+        self.canvas_epoch = self.canvas_epoch.wrapping_add(1);
+        self.states.reset(count);
+        self.reset_pending = true;
+        self.keep_cache_pending = true;
+        Ok(())
+    }
+    pub fn canvas_epoch(&self) -> u16 {
+        self.canvas_epoch
     }
     pub fn set_qos_state(&mut self, state: QoSState) {
         self.config.qos_state = state;
@@ -261,6 +279,11 @@ impl GDeskEncoder {
             frame_flags: flags
                 | if self.reset_pending {
                     KEYFRAME_RESET
+                        | if self.keep_cache_pending {
+                            protocol::CACHE_KEEP
+                        } else {
+                            0
+                        }
                 } else {
                     0
                 },
@@ -271,6 +294,7 @@ impl GDeskEncoder {
         };
         let bytes = protocol::encode_frame(header, &records)?;
         self.reset_pending = false;
+        self.keep_cache_pending = false;
         self.stats.frames += 1;
         self.stats.encoded_bytes += bytes.len() as u64;
         self.stats.qos_state = self.config.qos_state;

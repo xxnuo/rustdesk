@@ -266,3 +266,16 @@ mod tests {
         assert!(validate_install_app_name("-RustDesk").is_err());
     }
 }
+
+#[cfg(all(feature = "gdesk", not(windows)))]
+#[must_use]
+pub struct GDeskFontSmoothingGuard {
+    _private: (),
+}
+
+#[cfg(all(feature = "gdesk", not(windows)))]
+impl GDeskFontSmoothingGuard {
+    pub fn new() -> hbb_common::ResultType<Self> {
+        Ok(Self { _private: () })
+    }
+}

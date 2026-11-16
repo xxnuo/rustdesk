@@ -3164,6 +3164,7 @@ name = "gdesk"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "libc",
  "log",
  "lz4_flex",
  "pollster",
@@ -4754,9 +4755,6 @@ name = "lz4_flex"
 version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13591d77a9b6d941f7e6fcade7f9dfd9e801308752bde50c0a9bb5852778c22c"
-dependencies = [
- "twox-hash",
-]
 
 [[package]]
 name = "mac_address"
@@ -9207,12 +9205,6 @@ dependencies = [
  "tokio-util",
  "webrtc-util",
 ]
-
-[[package]]
-name = "twox-hash"
-version = "2.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typenum"

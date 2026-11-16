@@ -5,6 +5,7 @@ pub const HEADER_LEN: usize = 32;
 pub const NEW_OS_FRAME: u8 = 1;
 pub const KEYFRAME_RESET: u8 = 2;
 pub const LZ4_COMPRESSED: u8 = 4;
+pub const CACHE_KEEP: u8 = 8;
 pub const MAX_TILES: usize = 8192;
 pub const MAX_UNCOMPRESSED_LEN: usize = MAX_TILES * 27000;
 
@@ -91,7 +92,7 @@ impl GDeskFrameHeader {
             encode_send_delay_us: r.u32()?,
             uncompressed_len: r.u32()?,
         };
-        if h.magic_version != MAGIC_VERSION || h.frame_flags & !7 != 0 {
+        if h.magic_version != MAGIC_VERSION || h.frame_flags & !15 != 0 {
             return Err(Error("invalid frame header"));
         }
         let tiles = tile_count(h.width, h.height)?;

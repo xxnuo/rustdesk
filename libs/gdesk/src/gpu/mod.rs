@@ -8,6 +8,9 @@ use std::{
 };
 use wgpu::util::DeviceExt;
 
+pub mod vram;
+pub use wgpu;
+
 const TILE_WORDS: u64 = 3 * 2048;
 
 const SCAN_WGSL: &str = r#"
@@ -246,6 +249,17 @@ impl GpuContext {
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::INDIRECT,
         )
+    }
+
+    pub fn create_frame_buffer(&self, rgba: &[u8]) -> wgpu::Buffer {
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("resident frame"),
+                contents: rgba,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            })
     }
 
     fn params(&self, width: u16, height: u16) -> Result<wgpu::Buffer> {
@@ -495,6 +509,7 @@ pub struct GpuEncoder {
     last_tail: [u32; 2],
     timer: Timer,
     ring: StagingRing,
+    export_ring: Option<StagingRing>,
     submitted: Instant,
 }
 
@@ -533,8 +548,83 @@ impl GpuEncoder {
             shifts: (0, 0),
             force: false,
             last_tail: [u32::MAX, u32::MAX],
+            export_ring: None,
             submitted: Instant::now(),
         })
+    }
+
+    pub fn dimensions(&self) -> (u16, u16) {
+        (self.width, self.height)
+    }
+
+    pub fn slot_buffer(&self, index: usize) -> Option<&wgpu::Buffer> {
+        self.slots.get(index).map(|slot| &slot.frame)
+    }
+
+    fn make_slot(&self, frame: wgpu::Buffer) -> FrameSlot {
+        let scan_binds = std::array::from_fn(|s| {
+            self.ctx.bind(
+                &self.scan,
+                &[
+                    (0, &self.params),
+                    (10, &frame),
+                    (11, &self.prev),
+                    (3, &self.outs[s].list),
+                    (4, &self.outs[s].args),
+                ],
+            )
+        });
+        let pack_binds = std::array::from_fn(|s| {
+            self.ctx.bind(
+                &self.pack,
+                &[
+                    (0, &self.params),
+                    (1, &frame),
+                    (3, &self.outs[s].list),
+                    (5, &self.outs[s].coeffs),
+                ],
+            )
+        });
+        FrameSlot {
+            frame,
+            scan_binds,
+            pack_binds,
+        }
+    }
+
+    /// Adopts a frame that already lives in GPU memory; no pixel data crosses the CPU.
+    pub fn attach_frame_buffer(&mut self, buffer: wgpu::Buffer) -> Result<usize> {
+        let bytes = self.width as u64 * self.height as u64 * 4;
+        if buffer.size() < bytes || !buffer.usage().contains(wgpu::BufferUsages::STORAGE) {
+            return Err(Error("frame buffer too small or not a storage buffer"));
+        }
+        let slot = self.make_slot(buffer);
+        self.slots.push(slot);
+        Ok(self.slots.len() - 1)
+    }
+
+    /// Reads back the tile list and coefficient blocks of the latest encoded frame.
+    pub fn read_export(&mut self, dirty_tiles: u32) -> Result<Vec<u8>> {
+        if dirty_tiles as usize > self.tiles as usize {
+            return Err(Error("dirty tiles exceed the frame"));
+        }
+        let list_bytes = dirty_tiles as u64 * 8;
+        let coeff_bytes = dirty_tiles as u64 * TILE_WORDS * 4;
+        if self.export_ring.is_none() {
+            self.export_ring = Some(StagingRing::new(
+                &self.ctx,
+                self.tiles as u64 * (8 + TILE_WORDS * 4),
+            ));
+        }
+        let out = &self.outs[self.last_ring_slot];
+        let ring = self.export_ring.as_mut().ok_or(Error("no export ring"))?;
+        let slot = ring.acquire()?;
+        let mut cmd = self.ctx.device.create_command_encoder(&Default::default());
+        cmd.copy_buffer_to_buffer(&out.list, 0, ring.buffer(slot), 0, list_bytes);
+        cmd.copy_buffer_to_buffer(&out.coeffs, 0, ring.buffer(slot), list_bytes, coeff_bytes);
+        let idx = self.ctx.queue.submit([cmd.finish()]);
+        ring.start_map(slot, list_bytes + coeff_bytes, idx);
+        ring.read_blocking(&self.ctx.device, slot)
     }
 
     pub fn set_quality(&mut self, shift_y: u8, shift_c: u8, force: bool) {
@@ -551,35 +641,8 @@ impl GpuEncoder {
             return Err(Error("frame slots must be uploaded in order"));
         }
         if index == self.slots.len() {
-            let frame = self.ctx.storage(bytes);
-            let scan_binds = std::array::from_fn(|s| {
-                self.ctx.bind(
-                    &self.scan,
-                    &[
-                        (0, &self.params),
-                        (10, &frame),
-                        (11, &self.prev),
-                        (3, &self.outs[s].list),
-                        (4, &self.outs[s].args),
-                    ],
-                )
-            });
-            let pack_binds = std::array::from_fn(|s| {
-                self.ctx.bind(
-                    &self.pack,
-                    &[
-                        (0, &self.params),
-                        (1, &frame),
-                        (3, &self.outs[s].list),
-                        (5, &self.outs[s].coeffs),
-                    ],
-                )
-            });
-            self.slots.push(FrameSlot {
-                frame,
-                scan_binds,
-                pack_binds,
-            });
+            let slot = self.make_slot(self.ctx.storage(bytes));
+            self.slots.push(slot);
         }
         self.ctx.queue.write_buffer(&self.slots[index].frame, 0, rgba);
         Ok(())
@@ -708,6 +771,9 @@ pub struct GpuDecoder {
     display: wgpu::Buffer,
     wstate: wgpu::Buffer,
     args: [wgpu::Buffer; 3],
+    list: wgpu::Buffer,
+    coeffs: wgpu::Buffer,
+    resample: wgpu::ComputePipeline,
     decode: wgpu::ComputePipeline,
     present: wgpu::ComputePipeline,
     decode_binds: [wgpu::BindGroup; 3],
@@ -720,8 +786,41 @@ pub struct GpuDecoder {
 
 impl GpuDecoder {
     pub fn new(ctx: Arc<GpuContext>, encoder: &GpuEncoder) -> Result<Self> {
-        let (width, height) = (encoder.width, encoder.height);
-        let tiles = encoder.tiles as u64;
+        Self::build(
+            ctx,
+            encoder.width,
+            encoder.height,
+            std::array::from_fn(|s| {
+                (
+                    encoder.outs[s].list.clone(),
+                    encoder.outs[s].coeffs.clone(),
+                    encoder.outs[s].args.clone(),
+                )
+            }),
+        )
+    }
+
+    /// A decoder that owns its tile list and coefficient buffers and is fed from packets.
+    pub fn new_standalone(ctx: Arc<GpuContext>, width: u16, height: u16) -> Result<Self> {
+        let tiles = protocol::tile_count(width, height)? as u64;
+        let list = ctx.storage(tiles * 8);
+        let coeffs = ctx.storage(tiles * TILE_WORDS * 4);
+        let args = ctx.storage(16);
+        Self::build(
+            ctx,
+            width,
+            height,
+            std::array::from_fn(|_| (list.clone(), coeffs.clone(), args.clone())),
+        )
+    }
+
+    fn build(
+        ctx: Arc<GpuContext>,
+        width: u16,
+        height: u16,
+        outs: [(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer); 3],
+    ) -> Result<Self> {
+        let tiles = protocol::tile_count(width, height)? as u64;
         let pixels = width as u64 * height as u64 * 4;
         let params = ctx.params(width, height)?;
         let canvas = ctx.storage(pixels);
@@ -730,13 +829,14 @@ impl GpuDecoder {
         let flags = ctx.storage(tiles * 4);
         let decode = ctx.pipeline("wavelet_decode");
         let present = ctx.pipeline("present");
+        let ctx_resample = ctx.pipeline("resample_sharpen");
         let decode_binds = std::array::from_fn(|s| {
             ctx.bind(
                 &decode,
                 &[
                     (0, &params),
-                    (3, &encoder.outs[s].list),
-                    (5, &encoder.outs[s].coeffs),
+                    (3, &outs[s].0),
+                    (5, &outs[s].1),
                     (6, &canvas),
                     (7, &wstate),
                     (8, &flags),
@@ -757,7 +857,10 @@ impl GpuDecoder {
             canvas,
             display,
             wstate,
-            args: std::array::from_fn(|s| encoder.outs[s].args.clone()),
+            args: std::array::from_fn(|s| outs[s].2.clone()),
+            list: outs[0].0.clone(),
+            coeffs: outs[0].1.clone(),
+            resample: ctx_resample,
             decode,
             present,
             decode_binds,
@@ -828,6 +931,70 @@ impl GpuDecoder {
 
     pub fn read_canvas(&self) -> Result<Vec<u8>> {
         self.read(&self.canvas)
+    }
+
+    pub fn dimensions(&self) -> (u16, u16) {
+        (self.width, self.height)
+    }
+
+    fn load_packet(&self, list: &[u32], coeffs: &[u8], dirty: u32) {
+        let bytes: Vec<u8> = list.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.ctx.queue.write_buffer(&self.list, 0, &bytes);
+        self.ctx.queue.write_buffer(&self.coeffs, 0, coeffs);
+        let args: Vec<u8> = [dirty, 1, 1, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.ctx.queue.write_buffer(&self.args[0], 0, &args);
+    }
+
+    /// Bridges a canvas decoded elsewhere (for example by the CPU codec) into GPU memory.
+    pub fn upload_canvas(&self, rgba: &[u8]) -> Result<()> {
+        if rgba.len() as u64 != self.width as u64 * self.height as u64 * 4 {
+            return Err(Error("invalid canvas size"));
+        }
+        self.ctx.queue.write_buffer(&self.canvas, 0, rgba);
+        Ok(())
+    }
+
+    /// Lanczos-2 resampling followed by contrast-adaptive sharpening, for a display widget whose
+    /// physical size differs from the canvas. Never falls back to bilinear.
+    pub fn resample_sharpen(&self, dst_w: u32, dst_h: u32, sharpness: f32) -> Result<Vec<u8>> {
+        if dst_w == 0 || dst_h == 0 || dst_w > 8192 || dst_h > 8192 {
+            return Err(Error("invalid target size"));
+        }
+        let bytes = dst_w as u64 * dst_h as u64 * 4;
+        let scaled = self.ctx.storage(bytes);
+        let params: Vec<u8> = [
+            self.width as u32,
+            self.height as u32,
+            dst_w,
+            dst_h,
+            sharpness.to_bits(),
+            0,
+            0,
+            0,
+        ]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+        let params = self
+            .ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("resample params"),
+                contents: &params,
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = self
+            .ctx
+            .bind(&self.resample, &[(6, &self.canvas), (13, &scaled), (14, &params)]);
+        let mut cmd = self.ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = cmd.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.resample);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(dst_w.div_ceil(16), dst_h.div_ceil(16), 1);
+        }
+        self.ctx.queue.submit([cmd.finish()]);
+        self.ctx.read_buffer(&scaled, bytes)
     }
 
     pub fn wavelet_state(&self) -> Result<Vec<u32>> {
