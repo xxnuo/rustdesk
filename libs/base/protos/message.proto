@@ -201,6 +201,8 @@ message MouseEvent {
   sint32 x = 2;
   sint32 y = 3;
   repeated ControlKey modifiers = 4;
+  uint32 gdesk_lease = 5;
+  uint32 gdesk_modifier_mask = 6;
 }
 
 enum KeyboardMode{
@@ -314,6 +316,8 @@ message KeyEvent {
   }
   repeated ControlKey modifiers = 8;
   KeyboardMode mode = 9;
+  uint32 gdesk_lease = 10;
+  uint32 gdesk_modifier_mask = 11;
 }
 
 message CursorData {

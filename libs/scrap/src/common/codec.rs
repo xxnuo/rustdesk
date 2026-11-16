@@ -89,6 +89,14 @@ pub trait EncoderApi {
     }
 
     #[cfg(feature = "gdesk")]
+    fn set_gdesk_qos(&mut self, _qos: u8) {}
+
+    #[cfg(feature = "gdesk")]
+    fn has_gdesk_pending_refinement(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "gdesk")]
     fn is_gdesk(&self) -> bool {
         false
     }

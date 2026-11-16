@@ -5,7 +5,7 @@ use crate::{
 use base::message_proto::{video_frame, EncodedVideoFrame, EncodedVideoFrames, VideoFrame};
 use gdesk::{
     protocol::KEYFRAME_RESET, GDeskConfig, GDeskDecoder, GDeskEncoder, GDeskFrameHeader,
-    PixelFormat,
+    PixelFormat, QoSState,
 };
 use hbb_common::{anyhow::anyhow, bail, ResultType};
 
@@ -84,7 +84,7 @@ impl EncoderApi for GDeskEncoderApi {
                 pixels,
                 self.width * 4,
                 PixelFormat::Bgra,
-                (ms.max(0) as u64).saturating_mul(1000),
+                gdesk::monotonic_us(),
             )
             .map_err(|e| anyhow!("gdesk encode failed: {e}"))?
         {
@@ -102,6 +102,15 @@ impl EncoderApi for GDeskEncoderApi {
             Some(bytes) => Ok(Some(to_video_frame(bytes, ms)?)),
             None => Ok(None),
         }
+    }
+
+    fn set_gdesk_qos(&mut self, qos: u8) {
+        self.inner
+            .set_qos_state(QoSState::try_from(qos).unwrap_or(QoSState::Red));
+    }
+
+    fn has_gdesk_pending_refinement(&self) -> bool {
+        self.inner.has_pending_refinement()
     }
 
     fn is_gdesk(&self) -> bool {
@@ -183,4 +192,37 @@ pub fn decode_into(
 
 pub fn is_gdesk_frame(frame: &video_frame::Union) -> bool {
     matches!(frame, video_frame::Union::Gdesks(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qos_trait_hooks_freeze_and_resume_refinement() {
+        let mut encoder = GDeskEncoderApi::new(
+            EncoderCfg::GDesk(GDeskEncoderConfig {
+                width: 64,
+                height: 64,
+            }),
+            false,
+        )
+        .unwrap();
+        let pixels: Vec<u8> = (0..64 * 64 * 4)
+            .map(|i| ((i * 173 + i / 9) & 255) as u8)
+            .collect();
+        encoder.set_gdesk_qos(1);
+        let frame = encoder
+            .encode_to_message(EncodeInput::YUV(&pixels), 0)
+            .unwrap();
+        let header = GDeskFrameHeader::from_bytes(&frame.gdesks().frames[0].data).unwrap();
+        assert_eq!(header.qos_state, QoSState::Yellow);
+        assert!(encoder.has_gdesk_pending_refinement());
+        for _ in 0..3 {
+            assert!(encoder.poll_refinement(1).unwrap().is_none());
+        }
+        encoder.set_gdesk_qos(0);
+        assert!(encoder.poll_refinement(2).unwrap().is_some());
+        assert!(!encoder.has_gdesk_pending_refinement());
+    }
 }

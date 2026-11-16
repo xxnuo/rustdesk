@@ -80,6 +80,10 @@ impl GDeskEncoder {
         self.reset_pending = true;
         Ok(())
     }
+    pub fn set_qos_state(&mut self, state: QoSState) {
+        self.config.qos_state = state;
+        self.stats.qos_state = state;
+    }
     pub fn has_pending_refinement(&self) -> bool {
         self.states.tiles.iter().any(|s| s.needs_refinement())
     }
@@ -166,6 +170,11 @@ impl GDeskEncoder {
                             QoSState::Green if old_heat < 16 => (2, 4),
                             QoSState::Green => (4, 6),
                         });
+                let (shift_y, shift_c) = match self.config.qos_state {
+                    QoSState::Green => (shift_y, shift_c),
+                    QoSState::Yellow => (shift_y.max(2), shift_c.max(4)),
+                    QoSState::Red => (shift_y.max(4), shift_c.max(6)),
+                };
                 let coeff = math::rgb_to_wavelet(&tile)?;
                 let payload = math::encode_wavelet_init(&coeff, shift_y, shift_c)?;
                 state.sent_shift_y = shift_y;
@@ -266,5 +275,53 @@ impl GDeskEncoder {
         self.stats.encoded_bytes += bytes.len() as u64;
         self.stats.qos_state = self.config.qos_state;
         Ok(Some(bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::GDeskDecoder;
+
+    #[test]
+    fn congestion_overrides_initial_shifts_and_green_refines_losslessly() {
+        for (qos, expected) in [(QoSState::Yellow, (2, 4)), (QoSState::Red, (4, 6))] {
+            let config = GDeskConfig {
+                initial_shifts: Some((0, 0)),
+                ..Default::default()
+            };
+            let mut encoder = GDeskEncoder::new(64, 64, config).unwrap();
+            let mut decoder = GDeskDecoder::new();
+            let rgb: Vec<u8> = (0..64 * 64 * 3)
+                .map(|i| ((i * 173 + i / 7) & 255) as u8)
+                .collect();
+            encoder.set_qos_state(qos);
+            let frame = encoder
+                .encode_frame(&rgb, 64 * 3, PixelFormat::Rgb, 1)
+                .unwrap()
+                .unwrap();
+            let (header, records) = protocol::decode_frame(&frame).unwrap();
+            assert_eq!(header.qos_state, qos);
+            assert!(
+                matches!(records[0], TileRecord::WaveletInit { shift_y, shift_c, .. }
+                if (shift_y, shift_c) == expected)
+            );
+            decoder.decode_frame(&frame).unwrap();
+            assert!(!decoder.is_lossless());
+            for _ in 0..3 {
+                assert!(encoder
+                    .encode_frame(&rgb, 64 * 3, PixelFormat::Rgb, 2)
+                    .unwrap()
+                    .is_none());
+                assert!(encoder.poll_pending_refinement().unwrap().is_none());
+            }
+            assert!(encoder.has_pending_refinement());
+            encoder.set_qos_state(QoSState::Green);
+            let refine = encoder.poll_pending_refinement().unwrap().unwrap();
+            assert_eq!(decoder.decode_frame(&refine).unwrap(), rgb);
+            assert!(decoder.is_lossless());
+            assert!(!encoder.has_pending_refinement());
+            assert!(encoder.poll_pending_refinement().unwrap().is_none());
+        }
     }
 }

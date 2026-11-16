@@ -726,6 +726,8 @@ fn run(vs: VideoService) -> ResultType<()> {
     let mut yuv = Vec::new();
     let mut mid_data = Vec::new();
     let mut repeat_encode_counter = 0;
+    #[cfg(feature = "gdesk")]
+    let mut gdesk_qos_state = 0u8;
     let repeat_encode_max = 10;
     let mut encode_fail_counter = 0;
     let mut first_frame = true;
@@ -757,6 +759,27 @@ fn run(vs: VideoService) -> ResultType<()> {
             &mut second_instant,
             &sp.name(),
         )?;
+        #[cfg(feature = "gdesk")]
+        if encoder.is_gdesk() {
+            let (state, skip) = {
+                let mut video_qos = VIDEO_QOS.lock().unwrap();
+                (
+                    video_qos.gdesk_qos_state(),
+                    video_qos.gdesk_should_skip_frame(),
+                )
+            };
+            if state != gdesk_qos_state {
+                encoder.set_gdesk_qos(state);
+                if gdesk_qos_state != 0 && state == 0 && encoder.has_gdesk_pending_refinement() {
+                    repeat_encode_counter = 0;
+                }
+                gdesk_qos_state = state;
+            }
+            if skip {
+                std::thread::sleep(spf);
+                continue;
+            }
+        }
         // On macOS, a refresh here would destroy a hardware encoder that has been fed a frame but
         // not yet produced its first packet, restarting the warm-up forever. Defer until it has;
         // one that never does is still switched away from by max_fail_times in handle_one_frame.
@@ -1041,7 +1064,16 @@ fn run(vs: VideoService) -> ResultType<()> {
         // may need to enable frame(timeout)
         log::trace!("{:?} {:?}", time::Instant::now(), elapsed);
         if elapsed < spf {
-            std::thread::sleep(spf - elapsed);
+            #[cfg(feature = "gdesk")]
+            let preempted = encoder.is_gdesk() && {
+                gdesk::wake::global().wait_timeout(spf - elapsed);
+                true
+            };
+            #[cfg(not(feature = "gdesk"))]
+            let preempted = false;
+            if !preempted {
+                std::thread::sleep(spf - elapsed);
+            }
         }
     }
 

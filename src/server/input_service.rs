@@ -1294,6 +1294,10 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     en.set_ignore_flags(enigo_ignore_flags());
     #[cfg(not(target_os = "macos"))]
     let mut to_release = Vec::new();
+    #[cfg(feature = "gdesk")]
+    if evt_type == MOUSE_TYPE_MOVE && !KEYS_DOWN.lock().unwrap().is_empty() {
+        fix_modifiers(&evt.modifiers[..], &mut en, 0);
+    }
     if evt_type == MOUSE_TYPE_DOWN {
         fix_modifiers(&evt.modifiers[..], &mut en, 0);
         #[cfg(target_os = "macos")]

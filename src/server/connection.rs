@@ -244,6 +244,8 @@ pub struct ConnInner {
     id: i32,
     tx: Option<Sender>,
     tx_video: Option<Sender>,
+    #[cfg(feature = "gdesk")]
+    tx_p0: Option<Sender>,
 }
 
 struct InputMouse {
@@ -429,6 +431,8 @@ pub struct Connection {
     options_in_login: Option<OptionMessage>,
     #[cfg(not(any(target_os = "ios")))]
     pressed_modifiers: HashSet<rdev::Key>,
+    #[cfg(feature = "gdesk")]
+    gdesk_input: gdesk::input::InputGuard,
     closed: bool,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     start_cm_ipc_para: Option<StartCmIpcPara>,
@@ -469,7 +473,13 @@ pub struct Connection {
 
 impl ConnInner {
     pub fn new(id: i32, tx: Option<Sender>, tx_video: Option<Sender>) -> Self {
-        Self { id, tx, tx_video }
+        Self {
+            id,
+            tx,
+            tx_video,
+            #[cfg(feature = "gdesk")]
+            tx_p0: None,
+        }
     }
 }
 
@@ -554,6 +564,9 @@ impl Connection {
         let (tx_to_cm, rx_to_cm) = mpsc::unbounded_channel::<ipc::Data>();
         let (tx, mut rx) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
         let (tx_video, mut rx_video) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
+        let (tx_p0, mut rx_p0) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
+        #[cfg(not(feature = "gdesk"))]
+        drop(tx_p0);
         let (tx_input, _rx_input) = std_mpsc::channel();
         let (tx_from_authed, mut rx_from_authed) = mpsc::unbounded_channel::<ipc::Data>();
         let mut hbbs_rx = crate::hbbs_http::sync::signal_receiver();
@@ -569,6 +582,8 @@ impl Connection {
                 id,
                 tx: Some(tx),
                 tx_video: Some(tx_video),
+                #[cfg(feature = "gdesk")]
+                tx_p0: Some(tx_p0),
             },
             require_2fa: crate::auth_2fa::get_2fa(None),
             awaiting_2fa: false,
@@ -636,6 +651,8 @@ impl Connection {
             options_in_login: None,
             #[cfg(not(any(target_os = "ios")))]
             pressed_modifiers: Default::default(),
+            #[cfg(feature = "gdesk")]
+            gdesk_input: Default::default(),
             closed: false,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             start_cm_ipc_para: Some(StartCmIpcPara {
@@ -735,9 +752,45 @@ impl Connection {
             (_tx_clip, rx_clip) = mpsc::unbounded_channel::<i32>();
         }
 
+        #[cfg(feature = "gdesk")]
+        let mut video_pace_until = Instant::now();
+        #[cfg(feature = "gdesk")]
+        let mut video_paced = false;
         loop {
+            #[cfg(feature = "gdesk")]
+            {
+                while let Ok((_, value)) = rx_p0.try_recv() {
+                    if let Err(err) = conn.stream.send(&value as &Message).await {
+                        conn.on_close(&err.to_string(), false).await;
+                        return;
+                    }
+                }
+            }
+            #[cfg(feature = "gdesk")]
+            let video_ready = Instant::now() >= video_pace_until;
+            #[cfg(not(feature = "gdesk"))]
+            let video_ready = true;
+            #[cfg(feature = "gdesk")]
+            if video_paced && video_ready {
+                video_paced = false;
+                video_service::VIDEO_QOS
+                    .lock()
+                    .unwrap()
+                    .user_gdesk_send_backlog(id, false);
+            }
+            #[cfg(feature = "gdesk")]
+            let pace_wait = video_pace_until.saturating_duration_since(Instant::now());
+            #[cfg(not(feature = "gdesk"))]
+            let pace_wait = Duration::ZERO;
             tokio::select! {
                 // biased; // video has higher priority // causing test_delay_timer failed while transferring big file
+                Some((_, value)) = rx_p0.recv() => {
+                    if let Err(err) = conn.stream.send(&value as &Message).await {
+                        conn.on_close(&err.to_string(), false).await;
+                        break;
+                    }
+                }
+                _ = time::sleep(pace_wait), if !video_ready => {}
 
                 // Both end an unauthorized connection at once, not on the next timer tick:
                 // told to go to make room, or past the grace for its authorization. Neither
@@ -1081,15 +1134,37 @@ impl Connection {
                         break;
                     }
                 }
-                Some((instant, value)) = rx_video.recv() => {
+                Some((instant, value)) = rx_video.recv(), if video_ready => {
                     if !conn.video_ack_required {
                         if let Some(message::Union::VideoFrame(vf)) = &value.union {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
                         }
                     }
+                    #[cfg(feature = "gdesk")]
+                    let paced_bytes = match &value.union {
+                        Some(message::Union::VideoFrame(vf)) => match &vf.union {
+                            Some(video_frame::Union::Gdesks(f)) => f.frames.iter().map(|e| e.data.len()).sum::<usize>(),
+                            _ => 0,
+                        },
+                        _ => 0,
+                    };
+                    #[cfg(feature = "gdesk")]
+                    let send_started = Instant::now();
                     if let Err(err) = conn.stream.send(&value as &Message).await {
                         conn.on_close(&err.to_string(), false).await;
                         break;
+                    }
+                    #[cfg(feature = "gdesk")]
+                    if paced_bytes > 0 {
+                        let send_elapsed = send_started.elapsed();
+                        video_service::VIDEO_QOS.lock().unwrap()
+                            .user_gdesk_send_backlog(id, send_elapsed > Duration::from_millis(5));
+                    }
+                    #[cfg(feature = "gdesk")]
+                    if paced_bytes > gdesk::sched::P1_PACE_THRESHOLD {
+                        let windows = (paced_bytes / gdesk::sched::P1_PACE_THRESHOLD) as u32;
+                        video_pace_until = Instant::now() + gdesk::sched::P1_PACE_WINDOW * windows;
+                        video_paced = true;
                     }
                 },
                 Some((instant, value)) = rx.recv() => {
@@ -1147,6 +1222,15 @@ impl Connection {
                         _ => {}
                     }
 
+                    #[cfg(feature = "gdesk")]
+                    if matches!(&msg.union, Some(message::Union::CursorPosition(_)))
+                        && scrap::codec::Encoder::negotiated_codec() == scrap::CodecFormat::GDesk
+                    {
+                        if let Some(tx) = conn.inner.tx_p0.as_ref() {
+                            allow_err!(tx.send((instant, msg)));
+                            continue;
+                        }
+                    }
                     let msg: &Message = &msg;
                     if let Err(err) = conn.stream.send(msg).await {
                         conn.on_close(&err.to_string(), false).await;
@@ -2472,6 +2556,50 @@ impl Connection {
             .ok();
     }
 
+    #[cfg(all(feature = "gdesk", not(any(target_os = "android", target_os = "ios"))))]
+    fn gdesk_check_input(
+        &mut self,
+        lease: u32,
+        modifier_mask: u32,
+        event: Option<(u16, bool)>,
+        discrete: bool,
+    ) -> bool {
+        use gdesk::input::*;
+        const MODIFIER_KEYS: [(u16, ControlKey); 8] = [
+            (MOD_LCTRL, ControlKey::Control),
+            (MOD_RCTRL, ControlKey::RControl),
+            (MOD_LSHIFT, ControlKey::Shift),
+            (MOD_RSHIFT, ControlKey::RShift),
+            (MOD_LALT, ControlKey::Alt),
+            (MOD_RALT, ControlKey::RAlt),
+            (MOD_LMETA, ControlKey::Meta),
+            (MOD_RMETA, ControlKey::RWin),
+        ];
+        match self.gdesk_input.check(lease, modifier_mask as u16, event) {
+            InputVerdict::Reject => {
+                hbb_common::throttled_log!(
+                    Duration::from_secs(10),
+                    warn,
+                    "reject input with stale session lease {lease}"
+                );
+                false
+            }
+            InputVerdict::Accept { release } => {
+                for (bit, key) in MODIFIER_KEYS {
+                    if release & bit != 0 {
+                        let mut up = KeyEvent::new();
+                        up.set_control_key(key);
+                        self.input_key(up, false);
+                    }
+                }
+                if discrete || release != 0 {
+                    gdesk::wake::global().notify_after(gdesk::wake::INPUT_WAKE_DELAY);
+                }
+                true
+            }
+        }
+    }
+
     #[inline]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn input_pointer(&self, msg: PointerDeviceEvent, conn_id: i32) {
@@ -3214,6 +3342,15 @@ impl Connection {
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.peer_keyboard_enabled() {
+                        #[cfg(all(feature = "gdesk", not(any(target_os = "android", target_os = "ios"))))]
+                        if !self.gdesk_check_input(
+                            me.gdesk_lease,
+                            me.gdesk_modifier_mask,
+                            None,
+                            me.mask & 0x7 != 0,
+                        ) {
+                            return true;
+                        }
                         if is_left_up(&me) {
                             CLICK_TIME.store(get_time(), Ordering::SeqCst);
                         } else {
@@ -3353,6 +3490,15 @@ impl Connection {
                         return true;
                     }
                     if self.peer_keyboard_enabled() {
+                        #[cfg(all(feature = "gdesk", not(any(target_os = "android", target_os = "ios"))))]
+                        if !self.gdesk_check_input(
+                            me.gdesk_lease,
+                            me.gdesk_modifier_mask,
+                            gdesk_modifier_event(&me),
+                            true,
+                        ) {
+                            return true;
+                        }
                         if is_enter(&me) {
                             CLICK_TIME.store(get_time(), Ordering::SeqCst);
                         }
@@ -3963,6 +4109,20 @@ impl Connection {
                             self.refresh_video_display(Some(display as usize));
                             self.update_auto_disconnect_timer();
                         }
+                    }
+                    #[cfg(feature = "gdesk")]
+                    Some(misc::Union::GdeskAck(ack)) => {
+                        let ack = gdesk::GDeskAck {
+                            acked_frame_seq: ack.acked_frame_seq,
+                            echo_capture_ts_us: ack.echo_capture_ts_us,
+                            client_recv_ts_us: ack.client_recv_ts_us,
+                            render_queue_depth: ack.render_queue_depth.min(u8::MAX as u32) as u8,
+                            tile_ack_bitmap: ack.tile_ack_bitmap.to_vec(),
+                        };
+                        video_service::VIDEO_QOS
+                            .lock()
+                            .unwrap()
+                            .user_gdesk_ack(self.inner.id(), &ack);
                     }
                     Some(misc::Union::VideoReceived(_)) => {
                         video_service::notify_video_frame_fetched_by_conn_id(
@@ -7918,4 +8078,27 @@ mod test {
         assert!(!replaced_by(&conn(3, remote, key(8, "peer")), 2, &mine));
         assert!(!replaced_by(&conn(3, remote, key(7, "other")), 2, &mine));
     }
+}
+
+#[cfg(all(feature = "gdesk", not(any(target_os = "android", target_os = "ios"))))]
+fn gdesk_modifier_event(me: &KeyEvent) -> Option<(u16, bool)> {
+    use gdesk::input::*;
+    if me.press {
+        return None;
+    }
+    let bit = match &me.union {
+        Some(key_event::Union::ControlKey(key)) => match key.enum_value() {
+            Ok(ControlKey::Control) => MOD_LCTRL,
+            Ok(ControlKey::RControl) => MOD_RCTRL,
+            Ok(ControlKey::Shift) => MOD_LSHIFT,
+            Ok(ControlKey::RShift) => MOD_RSHIFT,
+            Ok(ControlKey::Alt) => MOD_LALT,
+            Ok(ControlKey::RAlt) => MOD_RALT,
+            Ok(ControlKey::Meta) => MOD_LMETA,
+            Ok(ControlKey::RWin) => MOD_RMETA,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((bit, me.down))
 }

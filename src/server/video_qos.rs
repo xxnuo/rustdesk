@@ -266,6 +266,8 @@ struct UserData {
     delay: UserDelay,
     record: bool,
     joined_at: Option<Instant>, // set by on_connection_open; the start-up guard's clock
+    #[cfg(feature = "gdesk")]
+    gdesk: gdesk::GDeskQos,
 }
 
 impl UserData {
@@ -387,6 +389,41 @@ impl VideoQoS {
     // Check if variable bitrate encoding is supported and enabled
     pub fn in_vbr_state(&self) -> bool {
         self.abr_config && self.displays.iter().all(|e| e.1.support_changing_quality)
+    }
+}
+
+#[cfg(feature = "gdesk")]
+impl VideoQoS {
+    pub fn user_gdesk_ack(&mut self, id: i32, ack: &gdesk::GDeskAck) {
+        let now = self.now();
+        if let Some(user) = self.users.get_mut(&id) {
+            user.gdesk.on_ack(ack, now);
+        }
+    }
+
+    pub fn user_gdesk_send_backlog(&mut self, id: i32, backlogged: bool) {
+        let now = self.now();
+        if let Some(user) = self.users.get_mut(&id) {
+            user.gdesk.set_send_backlog(backlogged, now);
+        }
+    }
+
+    pub fn gdesk_qos_state(&mut self) -> u8 {
+        let now = self.now();
+        self.users
+            .values_mut()
+            .map(|user| user.gdesk.state(now) as u8)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn gdesk_should_skip_frame(&mut self) -> bool {
+        let now = self.now();
+        let mut skip = false;
+        for user in self.users.values_mut() {
+            skip |= user.gdesk.should_skip_frame(now);
+        }
+        skip
     }
 }
 
@@ -895,6 +932,42 @@ mod tests {
         }
         assert_eq!(qos.fps(), FPS);
         qos
+    }
+
+    #[cfg(feature = "gdesk")]
+    #[test]
+    fn gdesk_tracks_each_viewer_and_expires_without_touching_legacy_qos() {
+        let mut qos = stable_qos();
+        qos.users.insert(2, UserData::default());
+        let fps = qos.fps();
+        let mut ack = gdesk::GDeskAck {
+            acked_frame_seq: 1,
+            render_queue_depth: 3,
+            ..Default::default()
+        };
+        qos.user_gdesk_ack(1, &ack);
+        assert_eq!(qos.gdesk_qos_state(), 2);
+        assert!(qos.gdesk_should_skip_frame());
+        assert!(!qos.gdesk_should_skip_frame());
+        ack.render_queue_depth = 0;
+        qos.user_gdesk_ack(2, &ack);
+        assert_eq!(qos.gdesk_qos_state(), 2);
+        ack.acked_frame_seq = 2;
+        qos.user_gdesk_ack(1, &ack);
+        assert_eq!(qos.gdesk_qos_state(), 0);
+        qos.user_gdesk_send_backlog(2, true);
+        assert_eq!(qos.gdesk_qos_state(), 2);
+        qos.advance_ms(500);
+        assert_eq!(qos.gdesk_qos_state(), 2);
+        qos.user_gdesk_send_backlog(2, false);
+        assert_eq!(qos.gdesk_qos_state(), 0);
+        ack.acked_frame_seq = 3;
+        ack.render_queue_depth = 1;
+        qos.user_gdesk_ack(1, &ack);
+        assert_eq!(qos.gdesk_qos_state(), 1);
+        qos.advance_ms(500);
+        assert_eq!(qos.gdesk_qos_state(), 0);
+        assert_eq!(qos.fps(), fps);
     }
 
     #[test]

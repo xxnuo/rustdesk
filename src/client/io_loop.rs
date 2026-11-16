@@ -1707,6 +1707,10 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.send_toggle_privacy_mode_msg(peer).await;
                     }
                     self.video_format = CodecFormat::from(&vf);
+                    #[cfg(feature = "gdesk")]
+                    let gdesk_frame = gdesk_frame_info(&vf);
+                    #[cfg(feature = "gdesk")]
+                    let gdesk_recv_us = gdesk::monotonic_us();
 
                     let display = vf.display as usize;
                     if !self.video_threads.contains_key(&display) {
@@ -1728,6 +1732,20 @@ impl<T: InvokeUiSession> Remote<T> {
                         } else {
                             thread.video_sender.send(MediaData::VideoQueue).ok();
                         }
+                    }
+                    #[cfg(feature = "gdesk")]
+                    if let Some((frame_seq, capture_ts_us)) = gdesk_frame {
+                        let depth = thread.video_queue.read().unwrap().len();
+                        let mut ack = GDeskAck::new();
+                        ack.acked_frame_seq = frame_seq;
+                        ack.echo_capture_ts_us = capture_ts_us;
+                        ack.client_recv_ts_us = gdesk_recv_us;
+                        ack.render_queue_depth = depth.min(u8::MAX as usize) as u32;
+                        let mut misc = Misc::new();
+                        misc.set_gdesk_ack(ack);
+                        let mut msg_out = Message::new();
+                        msg_out.set_misc(misc);
+                        allow_err!(peer.send(&msg_out).await);
                     }
                 }
                 Some(message::Union::Hash(hash)) => {
@@ -3324,4 +3342,13 @@ mod kept_cursor_tests {
         bomb.colors = hbb_common::compress::compress(&vec![0u8; 1 << 20]).into();
         assert!(kept_cursor_rgba(bomb).is_err(), "more pixels than its size");
     }
+}
+
+#[cfg(feature = "gdesk")]
+fn gdesk_frame_info(vf: &VideoFrame) -> Option<(u32, u64)> {
+    let Some(video_frame::Union::Gdesks(frames)) = &vf.union else {
+        return None;
+    };
+    let header = gdesk::GDeskFrameHeader::from_bytes(&frames.frames.last()?.data).ok()?;
+    Some((header.frame_seq, header.capture_ts_us))
 }
