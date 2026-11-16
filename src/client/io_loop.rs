@@ -96,6 +96,8 @@ pub struct Remote<T: InvokeUiSession> {
     data_count: Arc<AtomicUsize>,
     video_format: CodecFormat,
     #[cfg(feature = "gdesk")]
+    gdesk_rtt_ms: Option<u32>,
+    #[cfg(feature = "gdesk")]
     gdesk_input_tx: Option<gdesk::udp::InputRedundancyTx<Vec<u8>>>,
     #[cfg(feature = "gdesk")]
     gdesk_input_lease: u32,
@@ -153,6 +155,8 @@ impl<T: InvokeUiSession> Remote<T> {
             client_conn_id: 0,
             data_count: Arc::new(AtomicUsize::new(0)),
             video_format: CodecFormat::Unknown,
+            #[cfg(feature = "gdesk")]
+            gdesk_rtt_ms: None,
             #[cfg(feature = "gdesk")]
             gdesk_input_tx: None,
             #[cfg(feature = "gdesk")]
@@ -449,13 +453,26 @@ impl<T: InvokeUiSession> Remote<T> {
                             } else {
                                 Some(self.video_format.clone())
                             };
-                            self.handler.update_quality_status(QualityStatus {
+                            #[allow(unused_mut)]
+                            let mut status = QualityStatus {
                                 speed: Some(speed),
                                 fps,
                                 chroma,
                                 codec_format,
                                 ..Default::default()
-                            });
+                            };
+                            #[cfg(feature = "gdesk")]
+                            if self.video_format == CodecFormat::GDesk {
+                                let display = self.handler.lc.read().unwrap().peer_info.as_ref()
+                                    .map(|info| info.current_display as usize);
+                                let thread = display.and_then(|id| self.video_threads.get(&id))
+                                    .or_else(|| self.video_threads.iter().min_by_key(|(id, _)| *id).map(|(_, thread)| thread));
+                                if let Some(metrics) = thread.and_then(|thread| thread.gdesk_metrics.read().unwrap().clone()) {
+                                    let queue_depth = thread.map_or(0, |thread| thread.video_queue.read().unwrap().len());
+                                    status.set_gdesk_metrics(&metrics, self.gdesk_rtt_ms, queue_depth);
+                                }
+                            }
+                            self.handler.update_quality_status(status);
                         }
                     }
                 }
@@ -2557,6 +2574,8 @@ impl<T: InvokeUiSession> Remote<T> {
                     _ => {}
                 },
                 Some(message::Union::TestDelay(t)) => {
+                    #[cfg(feature = "gdesk")]
+                    if !t.from_client { self.gdesk_rtt_ms = Some(t.last_delay); }
                     self.handler.handle_test_delay(t, peer).await;
                 }
                 Some(message::Union::AudioFrame(frame)) => {
@@ -2972,6 +2991,8 @@ impl<T: InvokeUiSession> Remote<T> {
         let decode_fps = Arc::new(RwLock::new(None));
         let frame_count = Arc::new(RwLock::new(0));
         let discard_queue = Arc::new(RwLock::new(false));
+        #[cfg(feature = "gdesk")]
+        let gdesk_metrics = Arc::new(RwLock::new(None));
         let video_thread = VideoThread {
             video_queue: video_queue.clone(),
             video_sender,
@@ -2979,6 +3000,8 @@ impl<T: InvokeUiSession> Remote<T> {
             frame_count: frame_count.clone(),
             fps_control: Default::default(),
             discard_queue: discard_queue.clone(),
+            #[cfg(feature = "gdesk")]
+            gdesk_metrics: gdesk_metrics.clone(),
         };
         let handler = self.handler.ui_handler.clone();
         crate::client::start_video_thread(
@@ -2989,6 +3012,8 @@ impl<T: InvokeUiSession> Remote<T> {
             decode_fps,
             self.chroma.clone(),
             discard_queue,
+            #[cfg(feature = "gdesk")]
+            gdesk_metrics,
             move |display: usize,
                   data: &mut scrap::ImageRgb,
                   _texture: *mut c_void,
@@ -3229,6 +3254,8 @@ struct VideoThread {
     frame_count: Arc<RwLock<usize>>,
     discard_queue: Arc<RwLock<bool>>,
     fps_control: FpsControl,
+    #[cfg(feature = "gdesk")]
+    gdesk_metrics: Arc<RwLock<Option<scrap::gdesk_codec::GDeskOverlayMetrics>>>,
 }
 
 impl Drop for VideoThread {

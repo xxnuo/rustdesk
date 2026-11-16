@@ -5,8 +5,18 @@ use crate::{
     Error, Result,
 };
 
+#[derive(Debug, Default, Clone)]
+pub struct GDeskDecodeStats {
+    pub cache_hits: u64,
+    pub solid_fills: u64,
+    pub two_color_texts: u64,
+    pub wavelet_inits: u64,
+    pub wavelet_refines: u64,
+}
+
 #[derive(Default)]
 pub struct GDeskDecoder {
+    pub stats: GDeskDecodeStats,
     pub cache: DeterministicLruCache,
     pub last_header: Option<GDeskFrameHeader>,
     pub(crate) canvas: Vec<u8>,
@@ -112,6 +122,13 @@ impl GDeskDecoder {
     }
     pub(crate) fn apply_record(&mut self, header: &GDeskFrameHeader, record: TileRecord) -> Result<()> {
         let index = record.tile_index() as usize;
+        let counter = match &record {
+            TileRecord::CacheHit { .. } => &mut self.stats.cache_hits,
+            TileRecord::SolidFill { .. } => &mut self.stats.solid_fills,
+            TileRecord::TwoColorText { .. } => &mut self.stats.two_color_texts,
+            TileRecord::WaveletInit { .. } => &mut self.stats.wavelet_inits,
+            TileRecord::WaveletRefine { .. } => &mut self.stats.wavelet_refines,
+        };
         let mut wavelet = None;
         let (rgb, lossless, insert) = match record {
             TileRecord::CacheHit { slot_id, .. } => {
@@ -173,7 +190,9 @@ impl GDeskDecoder {
             header.width as usize * 3,
             PixelFormat::Rgb,
             index,
-        )
+        )?;
+        *counter = counter.saturating_add(1);
+        Ok(())
     }
     pub(crate) fn render(&mut self) {
         self.rendered_canvas.clone_from(&self.canvas);

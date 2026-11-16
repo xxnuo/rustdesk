@@ -153,6 +153,8 @@ pub struct Decoder {
     h265_media_codec: MediaCodecDecoder,
     #[cfg(feature = "gdesk")]
     pub(super) gdesk: Option<gdesk::GDeskDecoder>,
+    #[cfg(feature = "gdesk")]
+    pub(super) gdesk_overlay: crate::gdesk_codec::GDeskOverlayState,
     format: CodecFormat,
     valid: bool,
     #[cfg(feature = "hwcodec")]
@@ -712,6 +714,8 @@ impl Decoder {
             h265_media_codec,
             #[cfg(feature = "gdesk")]
             gdesk,
+            #[cfg(feature = "gdesk")]
+            gdesk_overlay: Default::default(),
             format,
             valid,
             #[cfg(feature = "hwcodec")]
@@ -761,11 +765,7 @@ impl Decoder {
             #[cfg(feature = "gdesk")]
             video_frame::Union::Gdesks(gdesks) => {
                 *chroma = Some(Chroma::I444);
-                if let Some(decoder) = &mut self.gdesk {
-                    crate::gdesk_codec::decode_into(decoder, gdesks, rgb)
-                } else {
-                    bail!("gdesk decoder not available");
-                }
+                self.handle_gdesks_video_frame(gdesks, rgb)
             }
             #[cfg(any(feature = "hwcodec", feature = "vram"))]
             video_frame::Union::H264s(h264s) => {

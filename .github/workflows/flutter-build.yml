@@ -2512,6 +2512,18 @@ jobs:
             # Opt-in like drm, and this container already builds with it.
             run_drm_tests "clipboard unix-file-copy-paste" \
               cargo test --locked -p clipboard --features unix-file-copy-paste
+            # GDesk requires newer Rust than the Sciter production toolchain. Keep it isolated.
+            wget -q -O /opt/gdesk-rust.tar.xz https://static.rust-lang.org/dist/rust-1.85.1-x86_64-unknown-linux-gnu.tar.xz
+            tar -xJf /opt/gdesk-rust.tar.xz -C /opt
+            /opt/rust-1.85.1-x86_64-unknown-linux-gnu/install.sh --prefix=/opt/gdesk-rust --without=rust-docs
+            # This runner has no GPU device; CPU gates and the opt-in runtime hooks still run.
+            run_drm_tests "gdesk CPU gates" \
+              env RUSTC=/opt/gdesk-rust/bin/rustc RUSTDOC=/opt/gdesk-rust/bin/rustdoc /opt/gdesk-rust/bin/cargo test --locked --release -p gdesk --no-default-features
+            run_drm_tests "scrap gdesk" \
+              env RUSTC=/opt/gdesk-rust/bin/rustc RUSTDOC=/opt/gdesk-rust/bin/rustdoc /opt/gdesk-rust/bin/cargo test --locked -p scrap --features gdesk
+            run_drm_tests "rustdesk gdesk" \
+              env RUSTC=/opt/gdesk-rust/bin/rustc RUSTDOC=/opt/gdesk-rust/bin/rustdoc /opt/gdesk-rust/bin/cargo test --locked --lib --features gdesk gdesk
+            rm -rf /opt/gdesk-rust /opt/rust-1.85.1-x86_64-unknown-linux-gnu /opt/gdesk-rust.tar.xz
             cargo build --locked --lib --features "$FEATURES" --release
             rm -rf target/release/deps target/release/build
             rm -rf ~/.cargo

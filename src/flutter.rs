@@ -734,6 +734,13 @@ impl InvokeUiSession for FlutterHandler {
                     &status.codec_format.map_or(NULL, |it| it.to_string()),
                 ),
                 ("chroma", &status.chroma.map_or(NULL, |it| it.to_string())),
+                ("gdesk_photon_latency", &status.gdesk_photon_latency.unwrap_or_default()),
+                ("gdesk_codec_us", &status.gdesk_codec_us.unwrap_or_default()),
+                ("gdesk_p99_jitter", &status.gdesk_p99_jitter.unwrap_or_default()),
+                ("gdesk_cache_hit_rate", &status.gdesk_cache_hit_rate.unwrap_or_default()),
+                ("gdesk_qos_light", &status.gdesk_qos_light.unwrap_or_default()),
+                ("gdesk_realtime_bandwidth", &status.gdesk_realtime_bandwidth.unwrap_or_default()),
+
             ],
             &[],
         );

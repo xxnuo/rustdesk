@@ -11,6 +11,30 @@ pub struct QualityStatus {
     pub target_bitrate: Option<i32>,
     pub codec_format: Option<CodecFormat>,
     pub chroma: Option<String>,
+    pub gdesk_photon_latency: Option<String>,
+    pub gdesk_codec_us: Option<String>,
+    pub gdesk_p99_jitter: Option<String>,
+    pub gdesk_cache_hit_rate: Option<String>,
+    pub gdesk_qos_light: Option<String>,
+    pub gdesk_realtime_bandwidth: Option<String>,
+}
+
+#[cfg(feature = "gdesk")]
+impl QualityStatus {
+    pub fn set_gdesk_metrics(
+        &mut self,
+        metrics: &scrap::gdesk_codec::GDeskOverlayMetrics,
+        rtt_ms: Option<u32>,
+        render_queue_depth: usize,
+    ) {
+        let estimated_ms = metrics.estimated_photon_latency_ms(rtt_ms.unwrap_or_default(), render_queue_depth);
+        self.gdesk_photon_latency = Some(format!("{estimated_ms:.2} ms"));
+        self.gdesk_codec_us = Some(format!("{}/{} us", metrics.encode_us, metrics.decode_us));
+        self.gdesk_p99_jitter = Some(format!("{:.2} ms", metrics.frame_p99_jitter_ms));
+        self.gdesk_cache_hit_rate = Some(format!("{:.1}%", metrics.cache_hit_ratio_pct));
+        self.gdesk_qos_light = Some(metrics.qos_light.to_owned());
+        self.gdesk_realtime_bandwidth = Some(format!("{} kbps", metrics.current_realtime_kbps()));
+    }
 }
 
 #[inline]

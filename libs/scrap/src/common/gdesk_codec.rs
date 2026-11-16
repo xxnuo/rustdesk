@@ -9,7 +9,153 @@ use gdesk::{
 };
 use hbb_common::{anyhow::anyhow, bail, ResultType};
 
-use std::convert::TryFrom;
+use std::{
+    collections::VecDeque,
+    convert::TryFrom,
+    time::{Duration, Instant},
+};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GDeskOverlayMetrics {
+    pub photon_latency_ms: f64,
+    pub encode_us: u32,
+    pub decode_us: u32,
+    pub frame_p99_jitter_ms: f64,
+    pub cache_hit_ratio_pct: f64,
+    pub qos_light: &'static str,
+    pub realtime_kbps: u32,
+    pub frame_interval_ms: f64,
+    measured_at: Instant,
+}
+
+impl GDeskOverlayMetrics {
+    pub fn estimated_photon_latency_ms(&self, rtt_ms: u32, render_queue_depth: usize) -> f64 {
+        self.photon_latency_ms
+            + rtt_ms as f64 / 2.0
+            + render_queue_depth as f64 * self.frame_interval_ms
+    }
+
+    pub fn current_realtime_kbps(&self) -> u32 {
+        if self.measured_at.elapsed() >= Duration::from_secs(1) {
+            0
+        } else {
+            self.realtime_kbps
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct GDeskOverlayState {
+    metrics: Option<GDeskOverlayMetrics>,
+    last_frame: Option<(u32, Instant)>,
+    last_interval: Option<Duration>,
+    jitter_us: VecDeque<u64>,
+    payloads: VecDeque<(Instant, u64)>,
+}
+
+impl GDeskOverlayState {
+    fn record(
+        &mut self,
+        packet: &[u8],
+        decode_us: u32,
+        now: Instant,
+        stats: &gdesk::decoder::GDeskDecodeStats,
+    ) -> ResultType<()> {
+        let header = GDeskFrameHeader::from_bytes(packet)
+            .map_err(|e| anyhow!("gdesk metrics header failed: {e}"))?;
+        let total_records = stats
+            .cache_hits
+            .saturating_add(stats.solid_fills)
+            .saturating_add(stats.two_color_texts)
+            .saturating_add(stats.wavelet_inits)
+            .saturating_add(stats.wavelet_refines);
+        if let Some((sequence, previous)) = self.last_frame {
+            if sequence != header.frame_seq {
+                let interval = now.saturating_duration_since(previous);
+                if let Some(old_interval) = self.last_interval {
+                    let jitter = interval
+                        .abs_diff(old_interval)
+                        .as_micros()
+                        .min(u64::MAX as u128) as u64;
+                    if self.jitter_us.len() == 64 {
+                        self.jitter_us.pop_front();
+                    }
+                    self.jitter_us.push_back(jitter);
+                }
+                self.last_interval = Some(interval);
+                self.last_frame = Some((header.frame_seq, now));
+            }
+        } else {
+            self.last_frame = Some((header.frame_seq, now));
+        }
+        while self
+            .payloads
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= Duration::from_secs(1))
+        {
+            self.payloads.pop_front();
+        }
+        // Group bursts into 20ms buckets, bounding the one-second payload window.
+        if let Some((_, bytes)) = self
+            .payloads
+            .back_mut()
+            .filter(|(at, _)| now.saturating_duration_since(*at) < Duration::from_millis(20))
+        {
+            *bytes = bytes.saturating_add(packet.len() as u64);
+        } else {
+            self.payloads.push_back((now, packet.len() as u64));
+        }
+        let mut jitter: Vec<u64> = self.jitter_us.iter().copied().collect();
+        jitter.sort_unstable();
+        let p99 = if jitter.is_empty() {
+            0
+        } else {
+            jitter[(jitter.len() * 99).div_ceil(100).saturating_sub(1)]
+        };
+        self.metrics = Some(GDeskOverlayMetrics {
+            // Half a 240Hz scanout, matching the Phase 5 photon estimate.
+            photon_latency_ms: (header.encode_send_delay_us as f64 + decode_us as f64 + 2_083.0)
+                / 1000.0,
+            encode_us: header.encode_send_delay_us,
+            decode_us,
+            frame_p99_jitter_ms: p99 as f64 / 1000.0,
+            cache_hit_ratio_pct: if total_records == 0 {
+                0.0
+            } else {
+                stats.cache_hits as f64 * 100.0 / total_records as f64
+            },
+            qos_light: match header.qos_state {
+                QoSState::Green => "Green",
+                QoSState::Yellow => "Yellow",
+                QoSState::Red => "Red",
+            },
+            realtime_kbps: self.bandwidth(now),
+            frame_interval_ms: self
+                .last_interval
+                .map_or(1000.0 / 240.0, |interval| interval.as_secs_f64() * 1000.0),
+            measured_at: now,
+        });
+        Ok(())
+    }
+
+    fn bandwidth(&self, now: Instant) -> u32 {
+        (self
+            .payloads
+            .iter()
+            .filter(|(at, _)| now.saturating_duration_since(*at) < Duration::from_secs(1))
+            .map(|(_, bytes)| *bytes)
+            .sum::<u64>()
+            .saturating_mul(8)
+            / 1000)
+            .min(u32::MAX as u64) as u32
+    }
+    fn snapshot(&self, now: Instant) -> Option<GDeskOverlayMetrics> {
+        self.metrics.clone().map(|mut metrics| {
+            metrics.realtime_kbps = self.bandwidth(now);
+            metrics
+        })
+    }
+}
 
 pub const MAX_REFINE_TILES_PER_FRAME: usize = 128;
 
@@ -296,6 +442,32 @@ pub fn decode_into(
 }
 
 impl crate::codec::Decoder {
+    pub fn gdesk_overlay_metrics(&self) -> Option<GDeskOverlayMetrics> {
+        self.gdesk_overlay.snapshot(Instant::now())
+    }
+
+    pub(super) fn handle_gdesks_video_frame(
+        &mut self,
+        frames: &EncodedVideoFrames,
+        rgb: &mut ImageRgb,
+    ) -> ResultType<bool> {
+        let started = Instant::now();
+        let decoder = self
+            .gdesk
+            .as_mut()
+            .ok_or_else(|| anyhow!("gdesk decoder unavailable"))?;
+        let decoded = decode_into(decoder, frames, rgb)?;
+        if decoded {
+            let decode_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+            let now = Instant::now();
+            for frame in &frames.frames {
+                self.gdesk_overlay
+                    .record(&frame.data, decode_us, now, &decoder.stats)?;
+            }
+        }
+        Ok(decoded)
+    }
+
     pub fn gdesk_tile_ack_bitmap(&self) -> Vec<u8> {
         self.gdesk
             .as_ref()
@@ -315,6 +487,7 @@ impl crate::codec::Decoder {
         height: usize,
         rgba: bool,
     ) -> ResultType<bool> {
+        let started = Instant::now();
         let header = GDeskFrameHeader::from_bytes(data)
             .map_err(|e| anyhow!("gdesk datagram header failed: {e}"))?;
         if (header.width as usize, header.height as usize) != (width, height) {
@@ -337,6 +510,9 @@ impl crate::codec::Decoder {
         decoder
             .write_into(rgb, width * format.bytes_per_pixel(), format)
             .map_err(|e| anyhow!("gdesk datagram output failed: {e}"))?;
+        let decode_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        self.gdesk_overlay
+            .record(data, decode_us, Instant::now(), &decoder.stats)?;
         Ok(!updated.is_empty())
     }
 }
@@ -348,6 +524,78 @@ pub fn is_gdesk_frame(frame: &video_frame::Union) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gdesk_overlay_reads_only_the_fixed_header() {
+        let header = GDeskFrameHeader {
+            width: 64,
+            height: 64,
+            tile_record_count: 1,
+            ..Default::default()
+        };
+        let stats = gdesk::decoder::GDeskDecodeStats {
+            cache_hits: 1,
+            ..Default::default()
+        };
+        let mut overlay = GDeskOverlayState::default();
+        overlay
+            .record(&header.to_bytes(), 10, Instant::now(), &stats)
+            .unwrap();
+        assert_eq!(overlay.metrics.as_ref().unwrap().cache_hit_ratio_pct, 100.0);
+    }
+
+    #[test]
+    fn gdesk_overlay_measures_jitter_cache_ratio_qos_and_idle_bandwidth() {
+        let now = Instant::now();
+        let mut overlay = GDeskOverlayState::default();
+        let mut bytes_in_window = 0u64;
+        for (index, ms) in [0, 16, 33, 49].iter().copied().enumerate() {
+            let header = GDeskFrameHeader {
+                width: 64,
+                height: 64,
+                frame_seq: index as u32 + 1,
+                encode_send_delay_us: 1200,
+                qos_state: QoSState::Yellow,
+                ..Default::default()
+            };
+            let record = if index == 0 {
+                gdesk::protocol::TileRecord::SolidFill {
+                    tile_index: 0,
+                    color: [1, 2, 3],
+                }
+            } else {
+                gdesk::protocol::TileRecord::CacheHit {
+                    tile_index: 0,
+                    slot_id: 0,
+                }
+            };
+            let packet = gdesk::protocol::encode_frame(header, &[record]).unwrap();
+            bytes_in_window += packet.len() as u64;
+            let stats = gdesk::decoder::GDeskDecodeStats {
+                solid_fills: 1,
+                cache_hits: index as u64,
+                ..Default::default()
+            };
+            overlay
+                .record(&packet, 300, now + Duration::from_millis(ms), &stats)
+                .unwrap();
+        }
+        let metrics = overlay.snapshot(now + Duration::from_millis(49)).unwrap();
+        assert_eq!(metrics.photon_latency_ms, 3.583);
+        assert_eq!(metrics.estimated_photon_latency_ms(20, 2), 45.583);
+        assert_eq!((metrics.encode_us, metrics.decode_us), (1200, 300));
+        assert_eq!(metrics.frame_p99_jitter_ms, 1.0);
+        assert_eq!(metrics.cache_hit_ratio_pct, 75.0);
+        assert_eq!(metrics.qos_light, "Yellow");
+        assert_eq!(metrics.realtime_kbps, (bytes_in_window * 8 / 1000) as u32);
+        assert_eq!(
+            overlay
+                .snapshot(now + Duration::from_secs(2))
+                .unwrap()
+                .realtime_kbps,
+            0
+        );
+    }
 
     #[test]
     fn gdesk_datagram_mode_emits_decodable_acknowledged_frames() {
@@ -380,6 +628,10 @@ mod tests {
             )
             .unwrap());
         assert_eq!(output.raw, [1, 2, 3, 255].repeat(64 * 64));
+        let metrics = decoder.gdesk_overlay_metrics().unwrap();
+        assert_eq!(metrics.qos_light, "Green");
+        assert_eq!(metrics.cache_hit_ratio_pct, 0.0);
+        assert!(metrics.photon_latency_ms.is_finite());
         let bitmap = decoder.gdesk_tile_ack_bitmap();
         assert_eq!(bitmap, vec![1]);
         let header = GDeskFrameHeader::from_bytes(&frame.gdesks().frames[0].data).unwrap();

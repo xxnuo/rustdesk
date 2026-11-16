@@ -338,10 +338,12 @@ impl GDeskEncoder {
 
     fn finish_udp(
         &mut self,
-        header: GDeskFrameHeader,
+        mut header: GDeskFrameHeader,
         records: Vec<TileRecord>,
         rounds: usize,
+        start: std::time::Instant,
     ) -> Result<Vec<Vec<u8>>> {
+        header.encode_send_delay_us = start.elapsed().as_micros().min(u32::MAX as u128) as u32;
         let unique = pack_udp_datagrams(&header, &records)?;
         let mut datagrams = Vec::with_capacity(unique.len() * rounds);
         for _ in 0..rounds.max(1) {
@@ -367,6 +369,7 @@ impl GDeskEncoder {
             stride,
             format,
         )?;
+        let start = std::time::Instant::now();
         let count = self.states.tiles.len();
         if self.udp.ensure(self.canvas_epoch, count) {
             self.cache.confirmed_slots.fill(false);
@@ -401,7 +404,12 @@ impl GDeskEncoder {
             return Ok(Vec::new());
         }
         self.frame_seq = header.frame_seq;
-        self.finish_udp(header, records, self.config.udp_redundancy_factor as usize)
+        self.finish_udp(
+            header,
+            records,
+            self.config.udp_redundancy_factor as usize,
+            start,
+        )
     }
 
     /// Resends tiles whose ack timed out or reported a loss, then advances refinement one step.
@@ -409,6 +417,7 @@ impl GDeskEncoder {
         if self.config.qos_state != QoSState::Green {
             return Ok(Vec::new());
         }
+        let start = std::time::Instant::now();
         let count = self.states.tiles.len();
         if self.udp.ensure(self.canvas_epoch, count) {
             self.cache.confirmed_slots.fill(false);
@@ -455,6 +464,7 @@ impl GDeskEncoder {
             header,
             records,
             self.config.udp_refine_redundancy_factor as usize,
+            start,
         )
     }
 
@@ -832,6 +842,7 @@ impl GDeskDecoder {
         staged.next += 1;
         if staged.next < parts {
             self.udp.staged.insert(index, staged);
+            self.stats.wavelet_refines = self.stats.wavelet_refines.saturating_add(1);
             return RefineOutcome::Applied;
         }
         staged.state.shift_y = to.0;
@@ -853,6 +864,7 @@ impl GDeskDecoder {
         )
         .is_ok()
         {
+            self.stats.wavelet_refines = self.stats.wavelet_refines.saturating_add(1);
             RefineOutcome::Applied
         } else {
             RefineOutcome::Invalid

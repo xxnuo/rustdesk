@@ -2861,6 +2861,16 @@ mod gdesk_video_tests {
             }
             assert!(handler.decoder.valid());
             assert_eq!(handler.fail_counter, 0);
+            let metrics = handler.decoder.gdesk_overlay_metrics().unwrap();
+            let mut quality = QualityStatus::default();
+            quality.set_gdesk_metrics(&metrics, Some(20), 0);
+            assert_eq!(quality.gdesk_photon_latency, Some(format!("{:.2} ms", metrics.photon_latency_ms + 10.0)));
+            assert_eq!(quality.gdesk_codec_us, Some(format!("{}/{} us", metrics.encode_us, metrics.decode_us)));
+            assert_eq!(quality.gdesk_qos_light.as_deref(), Some("Green"));
+            assert!(quality.gdesk_p99_jitter.is_some());
+            assert!(quality.gdesk_cache_hit_rate.is_some());
+            assert!(quality.gdesk_realtime_bandwidth.is_some());
+            if width == 128 { assert!(metrics.cache_hit_ratio_pct > 0.0); }
         }
         handler.reset(Some(CodecFormat::GDesk));
         encoder.resize_seamless(64, 64).unwrap();
@@ -4112,6 +4122,8 @@ pub fn start_video_thread<F, T>(
     fps: Arc<RwLock<Option<usize>>>,
     chroma: Arc<RwLock<Option<Chroma>>>,
     discard_queue: Arc<RwLock<bool>>,
+    #[cfg(feature = "gdesk")]
+    gdesk_metrics: Arc<RwLock<Option<scrap::gdesk_codec::GDeskOverlayMetrics>>>,
     video_callback: F,
 ) where
     F: 'static + FnMut(usize, &mut scrap::ImageRgb, *mut c_void, bool) + Send,
@@ -4174,6 +4186,10 @@ pub fn start_video_thread<F, T>(
                             let gdesk_ack = io_loop::gdesk_frame_header(&vf).map(|header| (header, gdesk::monotonic_us()));
                             match handler.handle_frame(vf, &mut pixelbuffer, &mut tmp_chroma) {
                                 Ok(true) => {
+                                    #[cfg(feature = "gdesk")]
+                                    {
+                                        *gdesk_metrics.write().unwrap() = handler.decoder.gdesk_overlay_metrics();
+                                    }
                                     video_callback(
                                         display,
                                         &mut handler.rgb,

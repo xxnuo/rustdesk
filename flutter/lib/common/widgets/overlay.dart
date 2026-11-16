@@ -606,6 +606,26 @@ class QualityMonitor extends StatelessWidget {
                       _row(
                           "Codec", qualityMonitorModel.data.codecFormat ?? '-'),
                       _row("Chroma", qualityMonitorModel.data.chroma ?? '-'),
+                      if (qualityMonitorModel.data.codecFormat == 'GDesk') ...[
+                        _row("Photon (est.)",
+                            qualityMonitorModel.data.gdeskPhotonLatency ?? '-'),
+                        _row("Enc/Dec",
+                            qualityMonitorModel.data.gdeskCodecUs ?? '-'),
+                        _row("P99 Jitter",
+                            qualityMonitorModel.data.gdeskP99Jitter ?? '-'),
+                        _row("Cache Hit",
+                            qualityMonitorModel.data.gdeskCacheHitRate ?? '-'),
+                        _row("QoS Light",
+                            qualityMonitorModel.data.gdeskQosLight ?? '-',
+                            rightColor:
+                                qualityMonitorModel.data.gdeskQosLight == 'Red'
+                                ? Colors.red
+                                : qualityMonitorModel.data.gdeskQosLight == 'Yellow'
+                                    ? Colors.yellow
+                                    : Colors.green),
+                        _row("GDesk Payload",
+                            qualityMonitorModel.data.gdeskRealtimeBandwidth ?? '-'),
+                      ],
                       if (qualityMonitorModel.webrtcTransport != null)
                         _row("Transport",
                             qualityMonitorModel.webrtcTransport!),

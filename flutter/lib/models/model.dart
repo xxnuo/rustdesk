@@ -3897,6 +3897,12 @@ class QualityMonitorData {
   String? targetBitrate;
   String? codecFormat;
   String? chroma;
+  String? gdeskPhotonLatency;
+  String? gdeskCodecUs;
+  String? gdeskP99Jitter;
+  String? gdeskCacheHitRate;
+  String? gdeskQosLight;
+  String? gdeskRealtimeBandwidth;
 }
 
 class QualityMonitorModel with ChangeNotifier {
@@ -3970,6 +3976,38 @@ class QualityMonitorModel with ChangeNotifier {
       }
       if (evt.containsKey('chroma') && (evt['chroma'] as String).isNotEmpty) {
         _data.chroma = evt['chroma'];
+      }
+      if (evt['gdesk_photon_latency'] is String &&
+          (evt['gdesk_photon_latency'] as String).isNotEmpty) {
+        _data.gdeskPhotonLatency = evt['gdesk_photon_latency'];
+      }
+      if (evt['gdesk_codec_us'] is String &&
+          (evt['gdesk_codec_us'] as String).isNotEmpty) {
+        _data.gdeskCodecUs = evt['gdesk_codec_us'];
+      }
+      if (evt['gdesk_p99_jitter'] is String &&
+          (evt['gdesk_p99_jitter'] as String).isNotEmpty) {
+        _data.gdeskP99Jitter = evt['gdesk_p99_jitter'];
+      }
+      if (evt['gdesk_cache_hit_rate'] is String &&
+          (evt['gdesk_cache_hit_rate'] as String).isNotEmpty) {
+        _data.gdeskCacheHitRate = evt['gdesk_cache_hit_rate'];
+      }
+      if (evt['gdesk_qos_light'] is String &&
+          (evt['gdesk_qos_light'] as String).isNotEmpty) {
+        _data.gdeskQosLight = evt['gdesk_qos_light'];
+      }
+      if (evt['gdesk_realtime_bandwidth'] is String &&
+          (evt['gdesk_realtime_bandwidth'] as String).isNotEmpty) {
+        _data.gdeskRealtimeBandwidth = evt['gdesk_realtime_bandwidth'];
+      }
+      if (_data.codecFormat != 'GDesk') {
+        _data.gdeskPhotonLatency = null;
+        _data.gdeskCodecUs = null;
+        _data.gdeskP99Jitter = null;
+        _data.gdeskCacheHitRate = null;
+        _data.gdeskQosLight = null;
+        _data.gdeskRealtimeBandwidth = null;
       }
       notifyListeners();
     } catch (e) {
