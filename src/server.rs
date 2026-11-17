@@ -88,6 +88,8 @@ type ConnMap = HashMap<i32, ConnInner>;
 
 #[derive(Clone, Default)]
 pub struct ConnectionMeta {
+    #[cfg(feature = "gdesk")]
+    pub gdesk_datagram: Option<crate::kcp_stream::GDeskDatagramLink>,
     pub control_permissions: Option<ControlPermissions>,
     pub controlled_context: Option<ControlledContext>,
 }

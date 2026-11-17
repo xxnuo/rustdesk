@@ -143,6 +143,7 @@ message PeerInfo {
   string platform_additions = 12;
   WindowsSessions windows_sessions = 13;
   uint32 gdesk_session_lease_id = 14;
+  uint32 gdesk_bulk_version = 15;
 }
 
 message WindowsSession {  
@@ -1029,6 +1030,28 @@ message PortForwardChannel {
   }
 }
 
+message GDeskTransportCapabilities {
+  uint32 bulk_version = 1;
+  uint32 datagram_version = 2;
+  bytes seed = 3;
+  bool ready = 4;
+  string active_backend = 5;
+  uint32 display = 6;
+}
+
+message GDeskBulkChunk {
+  uint64 transfer_id = 1;
+  uint32 chunk_index = 2;
+  uint32 total_chunks = 3;
+  bytes payload = 4;
+  uint32 total_bytes = 5;
+  uint64 credit_seq = 6;
+}
+
+message GDeskBulkAck {
+  uint64 credit_seq = 1;
+}
+
 message Message {
   oneof union {
     SignedId signed_id = 3;
@@ -1064,5 +1087,8 @@ message Message {
     PortForwardChannel port_forward_channel = 33;
     // Auto Login: the peer types the password only if it is at its logon or lock screen.
     OSLogin os_login = 34;
+    GDeskTransportCapabilities gdesk_transport = 35;
+    GDeskBulkChunk gdesk_bulk_chunk = 36;
+    GDeskBulkAck gdesk_bulk_ack = 37;
   }
 }

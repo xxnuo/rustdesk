@@ -14,6 +14,10 @@ mod server;
 #[cfg(not(any(target_os = "ios")))]
 pub use self::server::*;
 mod client;
+#[cfg(feature = "gdesk")]
+mod gdesk_bulk;
+#[cfg(feature = "gdesk")]
+mod gdesk_session;
 mod lan;
 #[cfg(not(any(target_os = "ios")))]
 mod rendezvous_mediator;

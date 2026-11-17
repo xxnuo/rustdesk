@@ -361,6 +361,10 @@ pub struct Connection {
     inner: ConnInner,
     display_idx: usize,
     stream: super::Stream,
+    #[cfg(feature = "gdesk")]
+    gdesk_session: crate::gdesk_session::Session,
+    #[cfg(feature = "gdesk")]
+    gdesk_video_pending: std::collections::VecDeque<(Instant, Message)>,
     server: super::ServerPtrWeak,
     hash: Hash,
     read_jobs: Vec<fs::TransferJob>,
@@ -433,6 +437,8 @@ pub struct Connection {
     pressed_modifiers: HashSet<rdev::Key>,
     #[cfg(feature = "gdesk")]
     gdesk_input: gdesk::input::InputGuard,
+    #[cfg(feature = "gdesk")]
+    gdesk_transport: crate::gdesk_bulk::Transport,
     #[cfg(feature = "gdesk")]
     gdesk_redundant_input: gdesk::udp::InputRedundancyRx,
     closed: bool,
@@ -557,6 +563,8 @@ impl Connection {
         let super::ConnectionMeta {
             control_permissions,
             controlled_context,
+            #[cfg(feature = "gdesk")]
+            gdesk_datagram,
         } = meta;
         // Android is not supported yet, so we always set control_permissions to None.
         #[cfg(target_os = "android")]
@@ -604,6 +612,14 @@ impl Connection {
             // with the primary index returned with the refreshed display snapshot.
             display_idx: 0,
             stream,
+            #[cfg(feature = "gdesk")]
+            gdesk_session: {
+                let mut session = crate::gdesk_session::Session::new(false);
+                session.set_link(gdesk_datagram);
+                session
+            },
+            #[cfg(feature = "gdesk")]
+            gdesk_video_pending: Default::default(),
             server,
             hash,
             read_jobs: Vec::new(),
@@ -665,6 +681,8 @@ impl Connection {
             pressed_modifiers: Default::default(),
             #[cfg(feature = "gdesk")]
             gdesk_input: Default::default(),
+            #[cfg(feature = "gdesk")]
+            gdesk_transport: Default::default(),
             #[cfg(feature = "gdesk")]
             gdesk_redundant_input: Default::default(),
             closed: false,
@@ -770,11 +788,21 @@ impl Connection {
         let mut video_pace_until = Instant::now();
         #[cfg(feature = "gdesk")]
         let mut video_paced = false;
-        #[cfg(feature = "gdesk")]
-        let mut gdesk_datagrams = std::collections::VecDeque::<(Instant, Message)>::new();
         loop {
             #[cfg(feature = "gdesk")]
             {
+                let authorized_remote = conn.authorized && conn.is_remote() && Self::peer_gdesk_capable(&conn.lr);
+                if let Err(err) = conn.gdesk_session.offer(&mut conn.stream, authorized_remote).await {
+                    log::trace!("GDesk UDP negotiation unavailable: {err}");
+                    conn.gdesk_session.fallback(&mut conn.stream).await;
+                }
+                conn.gdesk_transport.set_active(conn.authorized && conn.is_remote()
+                    && Self::peer_gdesk_capable(&conn.lr)
+                    && scrap::codec::Encoder::negotiated_codec() == scrap::CodecFormat::GDesk);
+                if let Err(err) = conn.gdesk_transport.check(Instant::now().into_std()) {
+                    conn.on_close(&err.to_string(), false).await;
+                    break;
+                }
                 for _ in 0..rx_p0.len().min(32) {
                     let Ok((_, value)) = rx_p0.try_recv() else { break };
                     if let Err(err) = conn.send_gdesk_p0(value).await {
@@ -784,7 +812,23 @@ impl Connection {
                 }
             }
             #[cfg(feature = "gdesk")]
-            let video_ready = Instant::now() >= video_pace_until && gdesk_datagrams.is_empty();
+            if conn.gdesk_transport.is_active() && !conn.gdesk_transport.has_video() && conn.gdesk_video_pending.is_empty() {
+                if let Ok((instant, value)) = rx_video.try_recv() {
+                    if !conn.video_ack_required {
+                        if let Some(message::Union::VideoFrame(vf)) = &value.union {
+                            video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
+                        }
+                    }
+                    if let Err(err) = conn.send_wire(&value).await {
+                        conn.on_close(&err.to_string(), false).await;
+                        break;
+                    }
+                }
+            }
+            #[cfg(feature = "gdesk")]
+            let video_ready = if conn.gdesk_transport.is_active() {
+                !conn.gdesk_transport.has_video() && conn.gdesk_video_pending.is_empty()
+            } else { Instant::now() >= video_pace_until && conn.gdesk_video_pending.is_empty() };
             #[cfg(not(feature = "gdesk"))]
             let video_ready = true;
             #[cfg(feature = "gdesk")]
@@ -796,30 +840,116 @@ impl Connection {
                     .user_gdesk_send_backlog(id, false);
             }
             #[cfg(feature = "gdesk")]
-            let pace_wait = if gdesk_datagrams.is_empty() {
+            let pace_wait = if conn.gdesk_video_pending.is_empty() {
                 video_pace_until.saturating_duration_since(Instant::now())
             } else { Duration::from_millis(30) };
             #[cfg(not(feature = "gdesk"))]
             let pace_wait = Duration::ZERO;
             #[cfg(feature = "gdesk")]
-            let gdesk_ready_at = gdesk_datagrams.front().map(|(at, _)| *at);
+            let gdesk_ready_at = if conn.gdesk_transport.has_control() || !rx_p0.is_empty() { None }
+                else { conn.gdesk_video_pending.front().map(|(at, _)| *at) };
             #[cfg(not(feature = "gdesk"))]
             let gdesk_ready_at: Option<Instant> = None;
             let wait_gdesk_datagram = async {
                 if let Some(at) = gdesk_ready_at { time::sleep_until(at).await; }
                 else { std::future::pending::<()>().await; }
             };
+            #[cfg(feature = "gdesk")]
+            let scheduled_at = conn.gdesk_transport.next_ready_at_with_bulk(rx_p0.is_empty() && rx.is_empty()
+                && !conn.gdesk_video_pending.front().is_some_and(|(at, _)| *at <= Instant::now())).map(Instant::from_std);
+            #[cfg(not(feature = "gdesk"))]
+            let scheduled_at: Option<Instant> = None;
+            let wait_scheduled = async {
+                if let Some(at) = scheduled_at { time::sleep_until(at).await; }
+                else { std::future::pending::<()>().await; }
+            };
             tokio::select! {
+                _ = wait_scheduled => {
+                    #[cfg(feature = "gdesk")]
+                    {
+                        // Recheck producers after select; only complete protocol frames reach the socket.
+                        for _ in 0..rx_p0.len().min(32) {
+                            if let Ok((_, value)) = rx_p0.try_recv() {
+                                if let Err(err) = conn.send_gdesk_p0(value).await {
+                                    conn.on_close(&err.to_string(), false).await;
+                                    return;
+                                }
+                            }
+                        }
+                        if conn.gdesk_transport.is_active() && !conn.gdesk_transport.has_video() && conn.gdesk_video_pending.is_empty() {
+                            if let Ok((instant, value)) = rx_video.try_recv() {
+                                if !conn.video_ack_required {
+                                    if let Some(message::Union::VideoFrame(vf)) = &value.union {
+                                        video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
+                                    }
+                                }
+                                if let Err(err) = conn.send_wire(&value).await {
+                                    conn.on_close(&err.to_string(), false).await;
+                                    break;
+                                }
+                            }
+                        }
+                        for _ in 0..rx.len().min(32) {
+                            if let Ok((instant, value)) = rx.try_recv() {
+                                match conn.queue_gdesk_message(instant, value).await {
+                                    Ok(true) => {},
+                                    Ok(false) => return,
+                                    Err(err) => {
+                                        conn.on_close(&err.to_string(), false).await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        let allow_bulk = rx_p0.is_empty() && rx.is_empty()
+                            && !conn.gdesk_video_pending.front().is_some_and(|(at, _)| *at <= Instant::now());
+                        let send_started = Instant::now();
+                        match conn.gdesk_transport.send_one(&mut conn.stream, allow_bulk).await {
+                            Ok(Some(gdesk::sched::Priority::P1)) => {
+                                video_service::VIDEO_QOS.lock().unwrap().user_gdesk_send_backlog(id,
+                                    send_started.elapsed() > Duration::from_millis(5));
+                            }
+                            Ok(_) => {},
+                            Err(err) => {
+                                conn.on_close(&err.to_string(), false).await;
+                                break;
+                            }
+                        }
+                    }
+                }
                 _ = wait_gdesk_datagram => {
                     #[cfg(feature = "gdesk")]
-                    if let Some((_, message)) = gdesk_datagrams.pop_front() {
+                    if conn.gdesk_transport.has_control() || !rx_p0.is_empty() { continue; }
+                    #[cfg(feature = "gdesk")]
+                    if let Some((_, message)) = conn.gdesk_video_pending.pop_front() {
                         let send_started = Instant::now();
-                        if let Err(err) = conn.stream.send(&message).await {
+                        let udp_result: ResultType<bool> = async {
+                            if !conn.authorized || !conn.is_remote() { return Ok(false); }
+                            let Some(message::Union::VideoFrame(video)) = &message.union else { return Ok(false); };
+                            if !conn.gdesk_session.prepare_video(&mut conn.stream, video).await? {
+                                return Ok(false);
+                            }
+                            conn.gdesk_session.send_video(&message).await
+                        }.await;
+                        let sent = match udp_result {
+                            Ok(sent) => sent,
+                            Err(err) => {
+                                log::trace!("GDesk UDP video fallback: {err}");
+                                conn.gdesk_session.fallback(&mut conn.stream).await;
+                                false
+                            }
+                        };
+                        let result = if sent { Ok(()) } else {
+                            crate::gdesk_bulk::send_message(&mut conn.gdesk_transport, &mut conn.stream, &message).await
+                        };
+                        if let Err(err) = result {
                             conn.on_close(&err.to_string(), false).await;
                             break;
                         }
-                        video_service::VIDEO_QOS.lock().unwrap()
-                            .user_gdesk_send_backlog(id, send_started.elapsed() > Duration::from_millis(5));
+                        if sent {
+                            video_service::VIDEO_QOS.lock().unwrap()
+                                .user_gdesk_send_backlog(id, send_started.elapsed() > Duration::from_millis(5));
+                        }
                     }
                 }
                 // biased; // video has higher priority // causing test_delay_timer failed while transferring big file
@@ -827,13 +957,13 @@ impl Connection {
                     #[cfg(feature = "gdesk")]
                     let result = conn.send_gdesk_p0(value).await;
                     #[cfg(not(feature = "gdesk"))]
-                    let result = conn.stream.send(&value as &Message).await;
+                    let result = conn.send_wire(&value as &Message).await;
                     if let Err(err) = result {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
                 }
-                _ = time::sleep(pace_wait), if !video_ready => {}
+                _ = time::sleep(pace_wait), if !video_ready && pace_wait > Duration::ZERO => {}
 
                 // Both end an unauthorized connection at once, not on the next timer tick:
                 // told to go to make room, or past the grace for its authorization. Neither
@@ -1013,6 +1143,14 @@ impl Connection {
                             }
                         }
                         ipc::Data::RawMessage(bytes) => {
+                            #[cfg(feature = "gdesk")]
+                            if conn.gdesk_transport.is_active() || !conn.gdesk_transport.is_empty() {
+                                if let Err(err) = crate::gdesk_bulk::send_raw(&mut conn.gdesk_transport, &mut conn.stream, bytes).await {
+                                    conn.on_close(&err.to_string(), false).await;
+                                    break;
+                                }
+                                continue;
+                            }
                             allow_err!(conn.stream.send_raw(bytes).await);
                         }
                         #[cfg(target_os = "windows")]
@@ -1038,7 +1176,7 @@ impl Connection {
                                     );
                                 }
                                 _ => {
-                                    allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
+                                    allow_err!(conn.send_wire(&clip_2_msg(clip)).await);
                                 }
                             }
                         }
@@ -1134,6 +1272,21 @@ impl Connection {
                                 last_recv_time = Instant::now();
                                 conn.session_last_recv_time.as_mut().map(|t| *t.lock().unwrap() = Instant::now());
                                 if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
+                                    #[cfg(feature = "gdesk")]
+                                    if matches!(msg_in.union, Some(message::Union::GdeskBulkChunk(_)) | Some(message::Union::GdeskBulkAck(_)))
+                                        && (!conn.authorized || !conn.is_remote()) {
+                                        conn.on_close("GDesk bulk outside authorized remote session", true).await;
+                                        break;
+                                    }
+                                    #[cfg(feature = "gdesk")]
+                                    let msg_in = match conn.gdesk_transport.receive_from_peer(msg_in, Instant::now().into_std(), &mut conn.stream).await {
+                                        Ok(Some(msg)) => msg,
+                                        Ok(None) => continue,
+                                        Err(err) => {
+                                            conn.on_close(&err.to_string(), true).await;
+                                            break;
+                                        }
+                                    };
                                     if !conn.on_message(msg_in).await {
                                         break;
                                     }
@@ -1155,7 +1308,13 @@ impl Connection {
                 _ = conn.file_timer.tick() => {
                     if !conn.read_jobs.is_empty() {
                         conn.send_to_cm(ipc::Data::FileTransferLog(("transfer".to_string(), fs::serialize_transfer_jobs(&conn.read_jobs))));
-                        match fs::handle_read_jobs(&mut conn.read_jobs, &mut conn.stream).await {
+                        #[cfg(feature = "gdesk")]
+                        let result = if conn.gdesk_transport.is_active() || !conn.gdesk_transport.is_empty() {
+                            crate::gdesk_bulk::handle_read_jobs(&mut conn.gdesk_transport, &mut conn.read_jobs).await
+                        } else { fs::handle_read_jobs(&mut conn.read_jobs, &mut conn.stream).await };
+                        #[cfg(not(feature = "gdesk"))]
+                        let result = fs::handle_read_jobs(&mut conn.read_jobs, &mut conn.stream).await;
+                        match result {
                             Ok(log) => {
                                 if !log.is_empty() {
                                     conn.send_to_cm(ipc::Data::FileTransferLog(("transfer".to_string(), log)));
@@ -1184,6 +1343,14 @@ impl Connection {
                         }
                     }
                     #[cfg(feature = "gdesk")]
+                    if conn.gdesk_transport.is_active() {
+                        if let Err(err) = conn.send_wire(&value).await {
+                            conn.on_close(&err.to_string(), false).await;
+                            break;
+                        }
+                        continue;
+                    }
+                    #[cfg(feature = "gdesk")]
                     let paced_bytes = match &value.union {
                         Some(message::Union::VideoFrame(vf)) => match &vf.union {
                             Some(video_frame::Union::Gdesks(f)) => f.frames.iter().map(|e| e.data.len()).sum::<usize>(),
@@ -1198,7 +1365,7 @@ impl Connection {
                         if matches!(&video.union, Some(video_frame::Union::Gdesks(frames))
                             if !frames.frames.is_empty() && frames.frames.iter().all(|frame| frame.gdesk_datagram))
                         {
-                            match enqueue_gdesk_datagrams(&mut gdesk_datagrams, video, Instant::now()) {
+                            match enqueue_gdesk_datagrams(&mut conn.gdesk_video_pending, video, Instant::now()) {
                                 Ok(()) => continue,
                                 Err(err) => {
                                     conn.on_close(&err.to_string(), false).await;
@@ -1208,9 +1375,9 @@ impl Connection {
                         }
                     }
                     #[cfg(feature = "gdesk")]
-                    let send_result = conn.stream.send(&value as &Message).await;
+                    let send_result = conn.send_wire(&value as &Message).await;
                     #[cfg(not(feature = "gdesk"))]
-                    let send_result = conn.stream.send(&value as &Message).await;
+                    let send_result = conn.send_wire(&value as &Message).await;
                     if let Err(err) = send_result {
                         conn.on_close(&err.to_string(), false).await;
                         break;
@@ -1229,6 +1396,17 @@ impl Connection {
                     }
                 },
                 Some((instant, value)) = rx.recv() => {
+                    #[cfg(feature = "gdesk")]
+                    if conn.gdesk_transport.is_active() || !conn.gdesk_transport.is_empty() {
+                        match conn.queue_gdesk_message(instant, value).await {
+                            Ok(true) => continue,
+                            Ok(false) => break,
+                            Err(err) => {
+                                conn.on_close(&err.to_string(), false).await;
+                                break;
+                            }
+                        }
+                    }
                     let latency = instant.elapsed().as_millis() as i64;
                     #[allow(unused_mut)]
                     let mut msg = value;
@@ -1273,7 +1451,7 @@ impl Connection {
                         Some(message::Union::MultiClipboards(_multi_clipboards)) => {
                             #[cfg(not(target_os = "ios"))]
                             if let Some(msg_out) = crate::clipboard::get_msg_if_not_support_multi_clip(&conn.lr.version, &conn.lr.my_platform, _multi_clipboards) {
-                                if let Err(err) = conn.stream.send(&msg_out).await {
+                                if let Err(err) = conn.send_wire(&msg_out).await {
                                     conn.on_close(&err.to_string(), false).await;
                                     break;
                                 }
@@ -1284,7 +1462,7 @@ impl Connection {
                     }
 
                     let msg: &Message = &msg;
-                    if let Err(err) = conn.stream.send(msg).await {
+                    if let Err(err) = conn.send_wire(msg).await {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
@@ -2096,6 +2274,10 @@ impl Connection {
             ..Default::default()
         };
         #[cfg(feature = "gdesk")]
+        if self.is_remote() {
+            pi.gdesk_bulk_version = crate::gdesk_bulk::BULK_VERSION;
+        }
+        #[cfg(feature = "gdesk")]
         if self.lr.option.as_ref().is_some_and(|option| option.supported_decoding.gdesk_input_redundancy) {
             let lease = hbb_common::sodiumoxide::randombytes::randombytes_uniform(u32::MAX - 1) + 1;
             self.gdesk_input.rotate_lease(lease);
@@ -2626,10 +2808,10 @@ impl Connection {
             }
             #[cfg(target_os = "macos")]
             if let Some(msg) = self.retina.on_cursor_pos(pos, self.display_idx) {
-                return self.stream.send(&msg).await;
+                return self.send_wire(&msg).await;
             }
         }
-        self.stream.send(value.as_ref()).await
+        self.send_wire(value.as_ref()).await
     }
 
     #[cfg(all(feature = "gdesk", not(any(target_os = "android", target_os = "ios"))))]
@@ -3101,6 +3283,17 @@ impl Connection {
     }
 
     async fn on_message(&mut self, msg: Message) -> bool {
+        #[cfg(feature = "gdesk")]
+        if let Some(message::Union::GdeskTransport(capabilities)) = &msg.union {
+            if self.authorized && self.is_remote() {
+                self.gdesk_transport.negotiate(capabilities.bulk_version);
+                if let Err(err) = self.gdesk_session.accept(&mut self.stream, true, capabilities).await {
+                    log::trace!("GDesk UDP capability fallback: {err}");
+                    self.gdesk_session.fallback(&mut self.stream).await;
+                }
+            }
+            return true;
+        }
         if let Some(message::Union::Misc(misc)) = &msg.union {
             // Move the CloseReason forward, as this message needs to be received when unauthorized, especially for kcp.
             if let Some(misc::Union::CloseReason(s)) = &misc.union {
@@ -5632,7 +5825,7 @@ impl Connection {
         }
         let mut msg_out = Message::new();
         msg_out.set_misc(misc);
-        self.send(msg_out).await;
+        allow_err!(self.stream.send(&msg_out).await);
         raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
     }
 
@@ -5943,8 +6136,72 @@ impl Connection {
     }
 
     #[inline]
+    #[cfg(feature = "gdesk")]
+    fn peer_gdesk_capable(lr: &LoginRequest) -> bool {
+        lr.option.as_ref().is_some_and(|o| o.supported_decoding.ability_gdesk > 0)
+    }
+
+    #[cfg(feature = "gdesk")]
+    async fn queue_gdesk_message(&mut self, instant: Instant, value: Arc<Message>) -> ResultType<bool> {
+        if instant.elapsed() > Duration::from_secs(1) && matches!(value.union, Some(message::Union::AudioFrame(_))) {
+            return Ok(true);
+        }
+        match &value.union {
+            Some(message::Union::Misc(misc)) if matches!(misc.union, Some(misc::Union::StopService(_))) => {
+                self.send_close_reason_no_retry("").await;
+                self.on_close("stop service", false).await;
+                return Ok(false);
+            }
+            Some(message::Union::PeerInfo(pi)) => {
+                self.refresh_video_display(None);
+                #[cfg(target_os = "macos")]
+                self.retina.set_displays(&pi.displays);
+                #[cfg(not(target_os = "macos"))]
+                let _ = pi;
+            }
+            Some(message::Union::CursorPosition(_)) => {
+                self.send_gdesk_p0(value).await?;
+                return Ok(true);
+            }
+            Some(message::Union::MultiClipboards(clips)) => {
+                #[cfg(not(target_os = "ios"))]
+                if let Some(msg) = crate::clipboard::get_msg_if_not_support_multi_clip(&self.lr.version, &self.lr.my_platform, clips) {
+                    self.send_wire(&msg).await?;
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+        self.send_wire(&value).await?;
+        Ok(true)
+    }
+
+    async fn send_wire(&mut self, msg: &Message) -> ResultType<()> {
+        #[cfg(feature = "gdesk")]
+        {
+            if self.authorized && self.is_remote() {
+                if let Some(message::Union::VideoFrame(video)) = &msg.union {
+                    match self.gdesk_session.prepare_video(&mut self.stream, video).await {
+                        Ok(true) if self.gdesk_video_pending.is_empty() => {
+                            enqueue_gdesk_datagrams(&mut self.gdesk_video_pending, video, Instant::now())?;
+                            return Ok(());
+                        }
+                        Ok(_) => {},
+                        Err(err) => {
+                            log::trace!("GDesk UDP metadata fallback: {err}");
+                            self.gdesk_session.fallback(&mut self.stream).await;
+                        }
+                    }
+                }
+            }
+            return crate::gdesk_bulk::send_message(&mut self.gdesk_transport, &mut self.stream, msg).await;
+        }
+        #[cfg(not(feature = "gdesk"))]
+        self.stream.send(msg).await
+    }
+
     async fn send(&mut self, msg: Message) {
-        allow_err!(self.stream.send(&msg).await);
+        allow_err!(self.send_wire(&msg).await);
     }
 
     pub fn alive_conns() -> Vec<i32> {
@@ -6531,8 +6788,8 @@ impl Connection {
             } else {
                 // Maybe we should end the connection, because copy&paste files causes everything to wait.
                 allow_err!(
-                    self.stream
-                        .send(&crate::clipboard_file::clip_2_msg(clip))
+                    self
+                        .send_wire(&crate::clipboard_file::clip_2_msg(clip))
                         .await
                 );
             }

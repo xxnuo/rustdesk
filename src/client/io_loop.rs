@@ -103,6 +103,10 @@ pub struct Remote<T: InvokeUiSession> {
     gdesk_input_lease: u32,
     #[cfg(feature = "gdesk")]
     gdesk_tail_pending: Option<Instant>,
+    #[cfg(feature = "gdesk")]
+    gdesk_transport: crate::gdesk_bulk::Transport,
+    #[cfg(feature = "gdesk")]
+    gdesk_session: crate::gdesk_session::Session,
     elevation_requested: bool,
     peer_info: ParsedPeerInfo,
     video_threads: HashMap<usize, VideoThread>,
@@ -163,6 +167,10 @@ impl<T: InvokeUiSession> Remote<T> {
             gdesk_input_lease: 0,
             #[cfg(feature = "gdesk")]
             gdesk_tail_pending: None,
+            #[cfg(feature = "gdesk")]
+            gdesk_transport: Default::default(),
+            #[cfg(feature = "gdesk")]
+            gdesk_session: crate::gdesk_session::Session::new(true),
             stop_voice_call_sender: None,
             voice_call_request_timestamp: None,
             elevation_requested: false,
@@ -178,6 +186,11 @@ impl<T: InvokeUiSession> Remote<T> {
     }
 
     pub async fn io_loop(&mut self, key: &str, token: &str, round: u32) {
+        #[cfg(feature = "gdesk")]
+        {
+            self.gdesk_transport = Default::default();
+            self.gdesk_session = crate::gdesk_session::Session::new(true);
+        }
         #[cfg(target_os = "windows")]
         let _file_clip_context_holder = {
             // `is_port_forward()` will not reach here, but we still check it for clarity.
@@ -221,6 +234,8 @@ impl<T: InvokeUiSession> Remote<T> {
         .await
         {
             Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server))) => {
+                #[cfg(feature = "gdesk")]
+                self.gdesk_session.set_link(kcp.as_ref().map(|kcp| kcp.gdesk_link()));
                 self.handler
                     .connection_round_state
                     .lock()
@@ -306,7 +321,16 @@ impl<T: InvokeUiSession> Remote<T> {
                 let mut last_rx_progress = peer.rx_progress();
                 let mut peer_gone = false;
 
-                loop {
+                'session: loop {
+                    #[cfg(feature = "gdesk")]
+                    {
+                        self.gdesk_transport.set_active(self.is_connected && self.handler.is_default()
+                            && self.video_format == CodecFormat::GDesk);
+                        if let Err(err) = self.gdesk_transport.check(Instant::now().into_std()) {
+                            self.handler.on_establish_connection_error(err.to_string());
+                            break;
+                        }
+                    }
                     #[cfg(feature = "gdesk")]
                     let gdesk_tail_ready_at = self.gdesk_tail_pending;
                     #[cfg(not(feature = "gdesk"))]
@@ -315,7 +339,58 @@ impl<T: InvokeUiSession> Remote<T> {
                         if let Some(at) = gdesk_tail_ready_at { time::sleep_until(at).await; }
                         else { std::future::pending::<()>().await; }
                     };
+                    #[cfg(feature = "gdesk")]
+                    let scheduled_at = self.gdesk_transport.next_ready_at_with_bulk(self.receiver.is_empty()).map(Instant::from_std);
+                    #[cfg(not(feature = "gdesk"))]
+                    let scheduled_at: Option<Instant> = None;
+                    let wait_scheduled = async {
+                        if let Some(at) = scheduled_at { time::sleep_until(at).await; }
+                        else { std::future::pending::<()>().await; }
+                    };
+                    #[cfg(feature = "gdesk")]
+                    let udp_link = if self.is_connected && self.handler.is_default() && peer.is_secured() {
+                        self.gdesk_session.receiver()
+                    } else { None };
+                    #[cfg(feature = "gdesk")]
+                    let udp_receive = async {
+                        if let Some(link) = &udp_link { link.recv_datagram().await }
+                        else { std::future::pending().await }
+                    };
+                    #[cfg(not(feature = "gdesk"))]
+                    let udp_receive = std::future::pending::<Option<()>>();
                     tokio::select! {
+                        packet = udp_receive => {
+                            #[cfg(feature = "gdesk")]
+                            match packet {
+                                Some(packet) => match self.gdesk_session.received_video(packet) {
+                                    Ok(bytes) => {
+                                        last_recv_time = Instant::now();
+                                        self.data_count.fetch_add(bytes.len(), Ordering::Relaxed);
+                                        if !self.handle_msg_from_peer(&bytes, &mut peer).await { break; }
+                                    }
+                                    Err(err) => log::trace!("Discarded GDesk UDP business packet: {err}"),
+                                },
+                                None => self.gdesk_session.fallback(&mut peer).await,
+                            }
+                            #[cfg(not(feature = "gdesk"))]
+                            let _ = packet;
+                        }
+                        _ = wait_scheduled => {
+                            #[cfg(feature = "gdesk")]
+                            {
+                                // Drain one bounded batch for classification; pending UI data forbids P2.
+                                for _ in 0..self.receiver.len().min(32) {
+                                    if let Ok(data) = self.receiver.try_recv() {
+                                        if !self.handle_msg_from_ui(data, &mut peer).await { break 'session; }
+                                    }
+                                }
+                                let allow_bulk = self.receiver.is_empty();
+                                if let Err(err) = self.gdesk_transport.send_one(&mut peer, allow_bulk).await {
+                                    self.handler.on_establish_connection_error(err.to_string());
+                                    break;
+                                }
+                            }
+                        }
                         _ = wait_gdesk_tail => {
                             #[cfg(feature = "gdesk")]
                             {
@@ -323,7 +398,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 if let Some(tx) = self.gdesk_input_tx.as_ref() {
                                     match gdesk_flush_input(tx) {
                                         Ok(packets) => for packet in packets {
-                                            allow_err!(peer.send(&gdesk_input_message(packet)).await);
+                                            allow_err!(self.send_wire(&mut peer, &gdesk_input_message(packet)).await);
                                         },
                                         Err(err) => log::warn!("GDesk input tail flush failed: {err}"),
                                     }
@@ -377,7 +452,13 @@ impl<T: InvokeUiSession> Remote<T> {
                                 break;
                             }
                             if !self.read_jobs.is_empty() {
-                                if let Err(err) = fs::handle_read_jobs(&mut self.read_jobs, &mut peer).await {
+                                #[cfg(feature = "gdesk")]
+                                let result = if self.gdesk_transport.is_active() || !self.gdesk_transport.is_empty() {
+                                    crate::gdesk_bulk::handle_read_jobs(&mut self.gdesk_transport, &mut self.read_jobs).await
+                                } else { fs::handle_read_jobs(&mut self.read_jobs, &mut peer).await };
+                                #[cfg(not(feature = "gdesk"))]
+                                let result = fs::handle_read_jobs(&mut self.read_jobs, &mut peer).await;
+                                if let Err(err) = result {
                                     self.handler.msgbox("error", "Connection Error", &err.to_string(), "");
                                     break;
                                 }
@@ -590,7 +671,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             self.initial_clipboard_pending = false;
                         }
                         let msg = crate::clipboard_file::clip_2_msg(clip);
-                        allow_err!(peer.send(&msg).await);
+                        allow_err!(self.send_wire(peer, &msg).await);
                     }
                 }
             },
@@ -715,6 +796,13 @@ impl<T: InvokeUiSession> Remote<T> {
         {
             None
         }
+    }
+
+    async fn send_wire(&mut self, peer: &mut Stream, msg: &Message) -> hbb_common::ResultType<()> {
+        #[cfg(feature = "gdesk")]
+        return crate::gdesk_bulk::send_message(&mut self.gdesk_transport, peer, msg).await;
+        #[cfg(not(feature = "gdesk"))]
+        peer.send(msg).await
     }
 
     async fn send_close_reason(&mut self, peer: &mut Stream, reason: &str) {
@@ -845,7 +933,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     return true;
                 }
                 if let Some(msg) = msg {
-                    allow_err!(peer.send(&msg).await);
+                    allow_err!(self.send_wire(peer, &msg).await);
                 }
             }
             Data::Message(msg) => {
@@ -915,7 +1003,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         match gdesk_encode_input(tx, &msg) {
                             Ok(Some(packets)) => {
                                 for packet in packets {
-                                    allow_err!(peer.send(&gdesk_input_message(packet)).await);
+                                    allow_err!(self.send_wire(peer, &gdesk_input_message(packet)).await);
                                 }
                                 self.gdesk_tail_pending = Some(Instant::now() + Duration::from_millis(20));
                                 return true;
@@ -926,7 +1014,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                 }
-                allow_err!(peer.send(&msg).await);
+                allow_err!(self.send_wire(peer, &msg).await);
             }
             Data::SendFiles((id, r#type, path, to, file_num, include_hidden, is_remote)) => {
                 log::info!("send files, is remote {}", is_remote);
@@ -959,7 +1047,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         od,
                     ));
                     allow_err!(
-                        peer.send(&fs::new_send(id, r#type, path, file_num, include_hidden))
+                        self.send_wire(peer, &fs::new_send(id, r#type, path, file_num, include_hidden))
                             .await
                     );
                 } else {
@@ -1031,7 +1119,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             self.read_jobs.push(job);
                             self.timer = crate::rustdesk_interval(time::interval(MILLI1));
                             allow_err!(
-                                peer.send(&fs::new_receive(id, to, file_num, files, total_size))
+                                self.send_wire(peer, &fs::new_receive(id, to, file_num, files, total_size))
                                     .await
                             );
                         }
@@ -1127,16 +1215,9 @@ impl<T: InvokeUiSession> Remote<T> {
                     if let Some(job) = get_job(id, &mut self.write_jobs) {
                         job.is_last_job = false;
                         job.is_resume = true;
-                        allow_err!(
-                            peer.send(&fs::new_send(
-                                id,
-                                fs::JobType::Generic,
-                                job.remote.clone(),
-                                job.file_num,
-                                job.show_hidden
-                            ))
-                            .await
-                        );
+                        let msg = fs::new_send(id, fs::JobType::Generic, job.remote.clone(),
+                            job.file_num, job.show_hidden);
+                        allow_err!(self.send_wire(peer, &msg).await);
                     }
                 } else {
                     if let Some(job) = get_job(id, &mut self.read_jobs) {
@@ -1154,16 +1235,9 @@ impl<T: InvokeUiSession> Remote<T> {
                                     // peer is not windows, need transform \ to /
                                     fs::transform_windows_path(&mut files);
                                 }
-                                allow_err!(
-                                    peer.send(&fs::new_receive(
-                                        id,
-                                        job.remote.clone(),
-                                        job.file_num,
-                                        files,
-                                        job.total_size(),
-                                    ))
-                                    .await
-                                );
+                                let msg = fs::new_receive(id, job.remote.clone(), job.file_num,
+                                    files, job.total_size());
+                                allow_err!(self.send_wire(peer, &msg).await);
                             }
                             fs::DataSource::MemoryCursor(_) => {
                                 // unreachable!()
@@ -1228,7 +1302,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         job.confirm(&req).await;
                         file_action.set_send_confirm(req);
                         msg.set_file_action(file_action);
-                        allow_err!(peer.send(&msg).await);
+                        allow_err!(self.send_wire(peer, &msg).await);
                     }
                 }
             }
@@ -1244,7 +1318,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         ..Default::default()
                     });
                     msg_out.set_file_action(file_action);
-                    allow_err!(peer.send(&msg_out).await);
+                    allow_err!(self.send_wire(peer, &msg_out).await);
                     self.remove_jobs
                         .insert(id, RemoveJob::new(Vec::new(), path, sep, is_remote));
                 } else {
@@ -1293,7 +1367,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     ..Default::default()
                 });
                 msg_out.set_file_action(file_action);
-                allow_err!(peer.send(&msg_out).await);
+                allow_err!(self.send_wire(peer, &msg_out).await);
             }
             Data::RemoveFile((id, path, file_num, is_remote)) => {
                 if is_remote {
@@ -1306,7 +1380,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         ..Default::default()
                     });
                     msg_out.set_file_action(file_action);
-                    allow_err!(peer.send(&msg_out).await);
+                    allow_err!(self.send_wire(peer, &msg_out).await);
                 } else {
                     #[cfg(target_os = "android")]
                     let result = if fs::android::is_path(path.as_ref()) {
@@ -1339,7 +1413,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         ..Default::default()
                     });
                     msg_out.set_file_action(file_action);
-                    allow_err!(peer.send(&msg_out).await);
+                    allow_err!(self.send_wire(peer, &msg_out).await);
                 } else {
                     #[cfg(target_os = "android")]
                     let result = if fs::android::is_path(path.as_ref()) {
@@ -1373,7 +1447,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         ..Default::default()
                     });
                     msg_out.set_file_action(file_action);
-                    allow_err!(peer.send(&msg_out).await);
+                    allow_err!(self.send_wire(peer, &msg_out).await);
                 } else {
                     #[cfg(target_os = "android")]
                     let err = if fs::android::is_path(path.as_ref()) {
@@ -1404,7 +1478,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 misc.set_elevation_request(request);
                 let mut msg = Message::new();
                 msg.set_misc(misc);
-                allow_err!(peer.send(&msg).await);
+                allow_err!(self.send_wire(peer, &msg).await);
                 self.elevation_requested = true;
             }
             Data::ElevateWithLogon(username, password) => {
@@ -1418,7 +1492,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 misc.set_elevation_request(request);
                 let mut msg = Message::new();
                 msg.set_misc(misc);
-                allow_err!(peer.send(&msg).await);
+                allow_err!(self.send_wire(peer, &msg).await);
                 self.elevation_requested = true;
             }
             Data::NewVoiceCall => {
@@ -1428,7 +1502,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     NonZeroI64::new(msg.voice_call_request().req_timestamp)
                         .unwrap_or(NonZeroI64::new(get_time()).unwrap()),
                 );
-                allow_err!(peer.send(&msg).await);
+                allow_err!(self.send_wire(peer, &msg).await);
                 self.handler.on_voice_call_waiting();
             }
             Data::CloseVoiceCall => {
@@ -1436,7 +1510,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 let msg = new_voice_call_request(false);
                 self.handler
                     .on_voice_call_closed("Closed manually by the peer");
-                allow_err!(peer.send(&msg).await);
+                allow_err!(self.send_wire(peer, &msg).await);
             }
             Data::ResetDecoder(display) => match display {
                 Some(display) => {
@@ -1465,7 +1539,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     sid,
                     ..Default::default()
                 });
-                allow_err!(peer.send(&msg).await);
+                allow_err!(self.send_wire(peer, &msg).await);
             }
             _ => {}
         }
@@ -1527,7 +1601,7 @@ impl<T: InvokeUiSession> Remote<T> {
             ..Default::default()
         });
         msg_out.set_file_action(file_action);
-        allow_err!(peer.send(&msg_out).await);
+        allow_err!(self.send_wire(peer, &msg_out).await);
         if let Some(job) = fs::remove_job(id, &mut self.write_jobs) {
             #[cfg(target_os = "android")]
             let mut job = job;
@@ -1721,7 +1795,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 let mut msg = Message::new();
                 msg.set_misc(misc);
                 // Send inline so a queued manual FPS update is applied after this decision.
-                allow_err!(peer.send(&msg).await);
+                allow_err!(self.send_wire(peer, &msg).await);
                 log::info!("Set fps to {}", auto_fps);
                 self.last_auto_fps = Some(auto_fps);
             }
@@ -1784,6 +1858,31 @@ impl<T: InvokeUiSession> Remote<T> {
 
     async fn handle_msg_from_peer(&mut self, data: &[u8], peer: &mut Stream) -> bool {
         if let Ok(msg_in) = Message::parse_from_bytes(&data) {
+            #[cfg(feature = "gdesk")]
+            if let Some(message::Union::GdeskTransport(caps)) = &msg_in.union {
+                let authorized_remote = self.is_connected && self.handler.is_default();
+                if let Err(err) = self.gdesk_session.accept(peer, authorized_remote, caps).await {
+                    log::trace!("GDesk UDP capability fallback: {err}");
+                    self.gdesk_session.fallback(peer).await;
+                }
+                return true;
+            }
+            #[cfg(feature = "gdesk")]
+            let msg_in = {
+                if matches!(msg_in.union, Some(message::Union::GdeskBulkChunk(_)) | Some(message::Union::GdeskBulkAck(_)))
+                    && (!self.is_connected || !self.handler.is_default()) {
+                    self.handler.on_establish_connection_error("GDesk bulk outside remote session".into());
+                    return false;
+                }
+                match self.gdesk_transport.receive_from_peer(msg_in, Instant::now().into_std(), peer).await {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => return true,
+                    Err(err) => {
+                        self.handler.on_establish_connection_error(err.to_string());
+                        return false;
+                    }
+                }
+            };
             match msg_in.union {
                 Some(message::Union::VideoFrame(vf)) => {
                     if !self.first_frame {
@@ -1847,6 +1946,20 @@ impl<T: InvokeUiSession> Remote<T> {
                         let peer_version = pi.version.clone();
                         let peer_platform = pi.platform.clone();
                         self.set_peer_info(&pi);
+                        #[cfg(feature = "gdesk")]
+                        if self.handler.is_default() && pi.gdesk_bulk_version == crate::gdesk_bulk::BULK_VERSION {
+                            let mut capabilities = Message::new();
+                            capabilities.set_gdesk_transport(GDeskTransportCapabilities {
+                                bulk_version: crate::gdesk_bulk::BULK_VERSION,
+                                ..Default::default()
+                            });
+                            // Complete the reliable handshake before any data can enter the new queues.
+                            if let Err(err) = peer.send(&capabilities).await {
+                                self.handler.on_establish_connection_error(err.to_string());
+                                return false;
+                            }
+                            self.gdesk_transport.negotiate(pi.gdesk_bulk_version);
+                        }
                         #[cfg(feature = "gdesk")]
                         {
                             self.gdesk_input_lease = pi.gdesk_session_lease_id;
@@ -2133,7 +2246,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                                 };
                                                 job.confirm(&req).await;
                                                 let msg = new_send_confirm(req);
-                                                allow_err!(peer.send(&msg).await);
+                                                allow_err!(self.send_wire(peer, &msg).await);
                                             } else {
                                                 self.handler.override_file_confirm(
                                                     digest.id,
@@ -2188,7 +2301,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                                         };
                                                         job.confirm(&req).await;
                                                         let msg = new_send_confirm(req);
-                                                        allow_err!(peer.send(&msg).await);
+                                                        allow_err!(self.send_wire(peer, &msg).await);
                                                     }
                                                     DigestCheckResult::NeedConfirm(digest) => {
                                                         let mut overwrite_strategy =
@@ -2216,7 +2329,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                                                 };
                                                             job.confirm(&req).await;
                                                             let msg = new_send_confirm(req);
-                                                            allow_err!(peer.send(&msg).await);
+                                                            allow_err!(self.send_wire(peer, &msg).await);
                                                         } else {
                                                             self.handler.override_file_confirm(
                                                                 digest.id,
@@ -2236,7 +2349,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                                     };
                                                         // This did not approve replacing an existing local file.
                                                         let msg = new_send_confirm(req);
-                                                        allow_err!(peer.send(&msg).await);
+                                                        allow_err!(self.send_wire(peer, &msg).await);
                                                     }
                                                 },
                                                 Err(err) => {
@@ -2979,7 +3092,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 }
 
                 for msg in out_msgs.into_iter() {
-                    allow_err!(_peer.send(&msg).await);
+                    allow_err!(self.send_wire(_peer, &msg).await);
                 }
             }
         }

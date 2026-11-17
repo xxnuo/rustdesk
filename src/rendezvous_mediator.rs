@@ -44,6 +44,8 @@ fn connection_meta(
     controlled_context: Option<ControlledContext>,
 ) -> ConnectionMeta {
     ConnectionMeta {
+        #[cfg(feature = "gdesk")]
+        gdesk_datagram: None,
         control_permissions,
         controlled_context,
     }
@@ -1543,6 +1545,11 @@ async fn udp_nat_listen(
         // The KCP session is up: from here it is a connection like any other and the connection
         // layer's own limits apply to it, so the place goes back for the next punch.
         drop(slot);
+        #[cfg(feature = "gdesk")]
+        let meta = ConnectionMeta {
+            gdesk_datagram: Some(stream.0.gdesk_link()),
+            ..meta
+        };
         crate::server::create_tcp_connection(server, stream.1, peer_addr_v4, true, meta).await?;
         Ok(())
     };

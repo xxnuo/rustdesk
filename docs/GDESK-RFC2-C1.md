@@ -6,7 +6,7 @@
 
 scrap 的 GDesk 生产编码器已启用真实硬件 GPU 小波计算，保留原 GDesk 协议、cache、QoS、refinement、ACK/重传状态机。Intel Vulkan 硬件、无适配器 CPU fallback、真实 Xvfb 捕获、活动/静止画面自动设备恢复已通过下述测试。GPU 功能接线完成不代表 4K 性能达标；测量发现明显额外成本，见性能段。
 
-我只改动：
+GPU 实施者负责以下文件：
 
 - `libs/gdesk/src/encoder.rs`
 - `libs/gdesk/src/gpu/mod.rs`
@@ -16,7 +16,7 @@ scrap 的 GDesk 生产编码器已启用真实硬件 GPU 小波计算，保留�
 - `libs/scrap/src/common/gdesk_codec.rs`
 - `libs/scrap/tests/gdesk_gpu_capture.rs`（新增）
 
-临时测试脚本、测量源文件及日志均在项目 `.tmp/`。根 Cargo.toml/Cargo.lock 无需修改。没有改 sched.rs、proto、src/、Flutter 或 workflow；这些文件工作树中的并行改动不属于 C1。
+临时测试脚本、测量源文件及日志均在项目 `.tmp/`。根 Cargo.toml/Cargo.lock 无需修改。GPU 实施者没有修改 sched.rs、proto、src/、Flutter 或 workflow。总调度另将后端协议单字段、客户端遥测与 Flutter Overlay、CI 恢复测试入口纳入 C1 提交 `de30b3a22`；C2/C3 的其他协议与会话改动未纳入该提交。
 
 ## 协议差异与接法
 
@@ -42,7 +42,7 @@ device-lost/uncaptured-error 回调标记故障，首个错误记录日志；生
 
 - `scrap::gdesk_codec::GDeskOverlayMetrics.pub active_backend: &'static str`。
 - 取值：GpuVulkan、GpuDx12、GpuMetal、CpuFallback；旧端/空值/未知值为 Unknown。
-- C2 添加的 `EncodedVideoFrame.gdesk_active_backend = 5` 已被发送端普通帧、数据报、refinement、恢复刷新全部填充。
+- C1 提交中的 `EncodedVideoFrame.gdesk_active_backend = 5` 已被发送端普通帧、数据报、refinement、恢复刷新全部填充。
 - decoder record 首先设 Unknown，再只用成功解码帧携带的远端字段覆盖，不从本地 decoder、是否安装 GPU 或编译 feature 推断远端后端。
 - `GDeskEncoderApi::active_backend()`、`gpu_dispatches()` 可用于生产路径验收；只有 dispatch_workgroups 实际提交才递增 dispatch 计数。
 - metrics 无消息时仍为 None；旧消息缺字段为 Unknown。单测显式验证远端 GpuVulkan、CpuFallback、空值和无效值四种情况。
