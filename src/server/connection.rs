@@ -493,6 +493,16 @@ impl Subscriber for ConnInner {
 
     #[inline]
     fn send(&mut self, msg: Arc<Message>) {
+        #[cfg(feature = "gdesk")]
+        if matches!(&msg.union, Some(message::Union::CursorPosition(_))
+            | Some(message::Union::CursorData(_)) | Some(message::Union::CursorId(_)))
+            && scrap::codec::Encoder::negotiated_codec() == scrap::CodecFormat::GDesk
+        {
+            if let Some(tx) = self.tx_p0.as_ref() {
+                allow_err!(tx.send((Instant::now(), msg)));
+                return;
+            }
+        }
         // Send SwitchDisplay on the same channel as VideoFrame to avoid send order problems.
         let tx_by_video = match &msg.union {
             Some(message::Union::VideoFrame(_)) => true,
@@ -765,8 +775,9 @@ impl Connection {
         loop {
             #[cfg(feature = "gdesk")]
             {
-                while let Ok((_, value)) = rx_p0.try_recv() {
-                    if let Err(err) = conn.stream.send(&value as &Message).await {
+                for _ in 0..rx_p0.len().min(32) {
+                    let Ok((_, value)) = rx_p0.try_recv() else { break };
+                    if let Err(err) = conn.send_gdesk_p0(value).await {
                         conn.on_close(&err.to_string(), false).await;
                         return;
                     }
@@ -813,7 +824,11 @@ impl Connection {
                 }
                 // biased; // video has higher priority // causing test_delay_timer failed while transferring big file
                 Some((_, value)) = rx_p0.recv() => {
-                    if let Err(err) = conn.stream.send(&value as &Message).await {
+                    #[cfg(feature = "gdesk")]
+                    let result = conn.send_gdesk_p0(value).await;
+                    #[cfg(not(feature = "gdesk"))]
+                    let result = conn.stream.send(&value as &Message).await;
+                    if let Err(err) = result {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
@@ -1268,15 +1283,6 @@ impl Connection {
                         _ => {}
                     }
 
-                    #[cfg(feature = "gdesk")]
-                    if matches!(&msg.union, Some(message::Union::CursorPosition(_)))
-                        && scrap::codec::Encoder::negotiated_codec() == scrap::CodecFormat::GDesk
-                    {
-                        if let Some(tx) = conn.inner.tx_p0.as_ref() {
-                            allow_err!(tx.send((instant, msg)));
-                            continue;
-                        }
-                    }
                     let msg: &Message = &msg;
                     if let Err(err) = conn.stream.send(msg).await {
                         conn.on_close(&err.to_string(), false).await;
@@ -2609,6 +2615,21 @@ impl Connection {
                 show_cursor,
             }))
             .ok();
+    }
+
+    #[cfg(feature = "gdesk")]
+    async fn send_gdesk_p0(&mut self, value: Arc<Message>) -> ResultType<()> {
+        if let Some(message::Union::CursorPosition(pos)) = &value.union {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if self.follow_remote_cursor {
+                self.handle_cursor_switch_display(pos.clone()).await;
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(msg) = self.retina.on_cursor_pos(pos, self.display_idx) {
+                return self.stream.send(&msg).await;
+            }
+        }
+        self.stream.send(value.as_ref()).await
     }
 
     #[cfg(all(feature = "gdesk", not(any(target_os = "android", target_os = "ios"))))]
@@ -8258,6 +8279,44 @@ fn enqueue_gdesk_datagrams(
 #[cfg(all(test, feature = "gdesk"))]
 mod gdesk_pacing_tests {
     use super::*;
+    #[test]
+    fn gdesk_subscriber_routes_cursor_ahead_of_bulk_and_preserves_video_order() {
+        use scrap::codec::{Encoder, EncodingUpdate};
+        Encoder::update(EncodingUpdate::Update(i32::MAX, SupportedDecoding {
+            ability_gdesk: 1,
+            prefer: supported_decoding::PreferCodec::GDesk.into(),
+            ..Default::default()
+        }));
+        assert_eq!(Encoder::negotiated_codec(), scrap::CodecFormat::GDesk);
+        let (tx, mut bulk) = mpsc::unbounded_channel();
+        let (video_tx, mut video) = mpsc::unbounded_channel();
+        let (p0_tx, mut p0) = mpsc::unbounded_channel();
+        let mut subscriber = ConnInner::new(7, Some(tx), Some(video_tx));
+        subscriber.tx_p0 = Some(p0_tx);
+        let mut clipboard = Message::new();
+        clipboard.set_clipboard(Clipboard::new());
+        subscriber.send(Arc::new(clipboard));
+        for union in [message::Union::CursorPosition(CursorPosition::new()),
+            message::Union::CursorData(CursorData::new()), message::Union::CursorId(1)] {
+            let msg = Arc::new(Message { union: Some(union), ..Default::default() });
+            subscriber.send(msg.clone());
+            assert_eq!(p0.try_recv().unwrap().1, msg);
+        }
+        let mut switch = Misc::new();
+        switch.set_switch_display(SwitchDisplay::new());
+        let mut msg = Message::new();
+        msg.set_misc(switch);
+        subscriber.send(Arc::new(msg));
+        let mut frame = Message::new();
+        frame.set_video_frame(VideoFrame::new());
+        subscriber.send(Arc::new(frame));
+        assert!(matches!(bulk.try_recv().unwrap().1.union, Some(message::Union::Clipboard(_))));
+        assert!(bulk.try_recv().is_err());
+        assert!(matches!(video.try_recv().unwrap().1.union, Some(message::Union::Misc(_))));
+        assert!(matches!(video.try_recv().unwrap().1.union, Some(message::Union::VideoFrame(_))));
+        Encoder::update(EncodingUpdate::Remove(i32::MAX));
+    }
+
     #[test]
     fn gdesk_video_sender_spreads_datagram_bursts_within_four_ms() {
         let frames = vec![

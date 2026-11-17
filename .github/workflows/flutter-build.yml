@@ -2523,6 +2523,8 @@ jobs:
               env RUSTC=/opt/gdesk-rust/bin/rustc RUSTDOC=/opt/gdesk-rust/bin/rustdoc /opt/gdesk-rust/bin/cargo test --locked -p scrap --features gdesk
             run_drm_tests "rustdesk gdesk" \
               env RUSTC=/opt/gdesk-rust/bin/rustc RUSTDOC=/opt/gdesk-rust/bin/rustdoc /opt/gdesk-rust/bin/cargo test --locked --lib --features gdesk gdesk
+            run_drm_tests "rustdesk flutter gdesk" \
+              env RUSTC=/opt/gdesk-rust/bin/rustc RUSTDOC=/opt/gdesk-rust/bin/rustdoc /opt/gdesk-rust/bin/cargo test --locked --lib --features flutter,gdesk gdesk
             rm -rf /opt/gdesk-rust /opt/rust-1.85.1-x86_64-unknown-linux-gnu /opt/gdesk-rust.tar.xz
             cargo build --locked --lib --features "$FEATURES" --release
             rm -rf target/release/deps target/release/build

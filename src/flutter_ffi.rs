@@ -2145,6 +2145,17 @@ pub fn session_alternative_codecs(session_id: SessionID) -> String {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         let (vp8, av1, h264, h265) = session.alternative_codecs();
         let msg = HashMap::from([("vp8", vp8), ("av1", av1), ("h264", h264), ("h265", h265)]);
+        #[cfg(feature = "gdesk")]
+        let msg = {
+            let mut msg = msg;
+            let lc = session.lc.read().unwrap();
+            msg.insert(
+                "gdesk",
+                lc.supported_encoding.gdesk
+                    && !lc.mark_unsupported.contains(&scrap::CodecFormat::GDesk),
+            );
+            msg
+        };
         serde_json::ser::to_string(&msg).unwrap_or("".to_owned())
     } else {
         String::new()

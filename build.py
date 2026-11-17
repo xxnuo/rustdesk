@@ -118,6 +118,8 @@ def make_parser():
              'Available: [Not used for now]. Special value is "ALL" and empty "". Default is empty.')
     parser.add_argument('--flutter', action='store_true',
                         help='Build flutter package', default=False)
+    parser.add_argument('--gdesk', action='store_true',
+                        help='Enable the opt-in GDesk codec (requires Rust 1.81+)')
     parser.add_argument(
         '--hwcodec',
         action='store_true',
@@ -320,6 +322,8 @@ def get_features(args):
         features.append('vram')
     if args.flutter:
         features.append('flutter')
+    if args.gdesk:
+        features.append('gdesk')
     if args.unix_file_copy_paste:
         features.append('unix-file-copy-paste')
     if args.drm:

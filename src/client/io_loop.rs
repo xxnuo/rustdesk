@@ -3343,6 +3343,8 @@ mod tests {
                 video_queue: Arc::new(RwLock::new(ArrayQueue::new(client::VIDEO_QUEUE_SIZE))),
                 video_sender,
                 decode_fps: Arc::new(RwLock::new(Some(23))),
+                #[cfg(feature = "gdesk")]
+                gdesk_metrics: Default::default(),
                 frame_count: Default::default(),
                 discard_queue: Default::default(),
                 fps_control: Default::default(),

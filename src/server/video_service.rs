@@ -203,6 +203,35 @@ impl VideoFrameController {
         }
     }
 
+    #[cfg(feature = "gdesk")]
+    fn wait_gdesk_next(&self, fetched: &mut HashSet<i32>, timeout: Duration) -> bool {
+        let receiver = FRAME_FETCHED_NOTIFIERS
+            .lock().unwrap().get(&self.display_idx).map(|n| n.1.clone());
+        let Some(receiver) = receiver else { return false };
+        let deadline = Instant::now() + timeout;
+        let mut input_woke = false;
+        loop {
+            if let Ok(mut receiver) = receiver.try_lock() {
+                // Bound the drain so a busy notifier cannot hide an input wake.
+                for _ in 0..receiver.len() {
+                    match receiver.try_recv() {
+                        Ok((id, _)) => { fetched.insert(id); }
+                        Err(_) => break,
+                    }
+                }
+            }
+            if fetched.is_superset(&self.send_conn_ids) || Instant::now() >= deadline {
+                return input_woke;
+            }
+            if gdesk::wake::global().wait_timeout(
+                deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(1)),
+            ) {
+                // An input wake must not bypass frame backpressure and drop queued deltas.
+                input_woke = true;
+            }
+        }
+    }
+
     #[tokio::main(flavor = "current_thread")]
     async fn try_wait_next(&mut self, fetched_conn_ids: &mut HashSet<i32>, timeout_millis: u64) {
         if self.send_conn_ids.is_empty() {
@@ -790,7 +819,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                 gdesk_qos_state = state;
             }
             if skip {
-                std::thread::sleep(spf);
+                gdesk::wake::global().wait_timeout(spf);
                 continue;
             }
         }
@@ -1095,10 +1124,23 @@ fn run(vs: VideoService) -> ResultType<()> {
         let mut fetched_conn_ids = HashSet::new();
         let timeout_millis = 3_000u64;
         let wait_begin = Instant::now();
+        #[cfg(feature = "gdesk")]
+        let mut input_woke = false;
+        #[cfg(not(feature = "gdesk"))]
+        let input_woke = false;
         while wait_begin.elapsed().as_millis() < timeout_millis as _ {
             if vs.source.is_monitor() {
                 check_privacy_mode_changed(&sp, display_idx, &c)?;
             }
+            #[cfg(feature = "gdesk")]
+            if encoder.is_gdesk() {
+                input_woke |= frame_controller.wait_gdesk_next(
+                    &mut fetched_conn_ids, Duration::from_millis(300),
+                );
+            } else {
+                frame_controller.try_wait_next(&mut fetched_conn_ids, 300);
+            }
+            #[cfg(not(feature = "gdesk"))]
             frame_controller.try_wait_next(&mut fetched_conn_ids, 300);
             // break if all connections have received current frame
             if fetched_conn_ids.len() >= frame_controller.send_conn_ids.len() {
@@ -1110,7 +1152,7 @@ fn run(vs: VideoService) -> ResultType<()> {
         let elapsed = now.elapsed();
         // may need to enable frame(timeout)
         log::trace!("{:?} {:?}", time::Instant::now(), elapsed);
-        if elapsed < spf {
+        if elapsed < spf && !input_woke {
             #[cfg(feature = "gdesk")]
             let preempted = encoder.is_gdesk() && {
                 gdesk::wake::global().wait_timeout(spf - elapsed);
@@ -1765,6 +1807,31 @@ fn handle_screenshot(screenshot: Screenshot, msg: String, w: usize, h: usize, da
 #[cfg(test)]
 mod tests {
     use super::refresh_allowed;
+
+    #[cfg(feature = "gdesk")]
+    #[test]
+    fn gdesk_input_wake_preserves_real_frame_notifier_backpressure() {
+        use super::*;
+        let display = usize::MAX;
+        let (tx, rx) = unbounded_channel();
+        FRAME_FETCHED_NOTIFIERS.lock().unwrap().insert(
+            display, (tx, Arc::new(TokioMutex::new(rx))),
+        );
+        let mut controller = VideoFrameController::new(display);
+        controller.send_conn_ids.insert(7);
+        let mut fetched = HashSet::new();
+        gdesk::wake::global().signal();
+        assert!(controller.wait_gdesk_next(&mut fetched, Duration::from_millis(5)));
+        assert!(fetched.is_empty(), "a wake is not a frame acknowledgement");
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            notify_video_frame_fetched(display, 7, None);
+        });
+        controller.wait_gdesk_next(&mut fetched, Duration::from_millis(300));
+        sender.join().unwrap();
+        FRAME_FETCHED_NOTIFIERS.lock().unwrap().remove(&display);
+        assert_eq!(fetched, HashSet::from([7]));
+    }
 
     #[cfg(feature = "gdesk")]
     #[test]

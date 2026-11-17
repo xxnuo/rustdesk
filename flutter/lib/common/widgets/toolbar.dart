@@ -882,6 +882,7 @@ Future<List<TRadioMenu<String>>> toolbarCodec(
           sessionId: sessionId, arg: kOptionCodecPreference) ??
       '';
   final List<bool> codecs = [];
+  var gdesk = false;
   try {
     final Map codecsJson = jsonDecode(alternativeCodecs);
     final vp8 = codecsJson['vp8'] ?? false;
@@ -892,11 +893,12 @@ Future<List<TRadioMenu<String>>> toolbarCodec(
     codecs.add(av1);
     codecs.add(h264);
     codecs.add(h265);
+    gdesk = codecsJson['gdesk'] == true;
   } catch (e) {
     debugPrint("Show Codec Preference err=$e");
   }
-  final visible =
-      codecs.length == 4 && (codecs[0] || codecs[1] || codecs[2] || codecs[3]);
+  final visible = codecs.length == 4 &&
+      (codecs[0] || codecs[1] || codecs[2] || codecs[3] || gdesk);
   if (!visible) {
     return _registerRadioMenuShortcuts<String>(ffi, [],
         ownedActionIds: _kToolbarCodecActionIds);
@@ -930,6 +932,12 @@ Future<List<TRadioMenu<String>>> toolbarCodec(
     if (codecs[1]) radio('AV1', 'av1', codecs[1], kShortcutActionCodecAv1),
     if (codecs[2]) radio('H264', 'h264', codecs[2], kShortcutActionCodecH264),
     if (codecs[3]) radio('H265', 'h265', codecs[3], kShortcutActionCodecH265),
+    if (gdesk)
+      TRadioMenu<String>(
+          child: const Text('GDesk'),
+          value: 'gdesk',
+          groupValue: groupValue,
+          onChanged: onChanged),
   ], ownedActionIds: _kToolbarCodecActionIds);
 }
 

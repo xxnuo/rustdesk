@@ -525,6 +525,55 @@ pub fn is_gdesk_frame(frame: &video_frame::Union) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn gdesk_capture_to_renderer_preserves_pixel_order_and_stride() {
+        for (input_format, pixel) in [
+            (Pixfmt::BGRA, [13, 37, 211, 0]),
+            (Pixfmt::RGBA, [211, 37, 13, 0]),
+        ] {
+            let row = [pixel.repeat(3), vec![99; 4]].concat();
+            let captured = row.repeat(2);
+            for datagrams in [false, true] {
+                let mut encoder = GDeskEncoderApi::new(
+                    EncoderCfg::GDesk(GDeskEncoderConfig {
+                        width: 3,
+                        height: 2,
+                    }),
+                    false,
+                )
+                .unwrap();
+                encoder.enable_udp_datagrams(datagrams).unwrap();
+                let frame = crate::Frame::PixelBuffer(crate::PixelBuffer::new(
+                    &captured,
+                    input_format,
+                    3,
+                    2,
+                ));
+                let mut converted = Vec::new();
+                let mut scratch = Vec::new();
+                let input = frame
+                    .to(encoder.yuvfmt(), &mut converted, &mut scratch)
+                    .unwrap();
+                assert_eq!(input.yuv().unwrap(), [13, 37, 211, 0].repeat(6));
+                let encoded = encoder.encode_to_message(input, 1).unwrap();
+                for (format, expected) in [
+                    (ImageFormat::ARGB, vec![13, 37, 211, 255]),
+                    (ImageFormat::ABGR, vec![211, 37, 13, 255]),
+                    (ImageFormat::Raw, vec![211, 37, 13]),
+                ] {
+                    let mut decoder = GDeskDecoder::new();
+                    let mut output = ImageRgb::new(format, 16);
+                    assert!(decode_into(&mut decoder, encoded.gdesks(), &mut output).unwrap());
+                    assert_eq!((output.w, output.h, output.raw.len()), (3, 2, 32));
+                    for row in output.raw.chunks_exact(16) {
+                        assert_eq!(&row[..3 * expected.len()], expected.repeat(3));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn gdesk_overlay_reads_only_the_fixed_header() {
         let header = GDeskFrameHeader {

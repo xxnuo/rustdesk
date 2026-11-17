@@ -2783,6 +2783,31 @@ impl VideoHandler {
 mod gdesk_video_tests {
     use super::*;
 
+    #[test]
+    fn gdesk_pixel_bytes_match_renderer_platform() {
+        let mut encoder = gdesk::GDeskEncoder::new(3, 2, Default::default()).unwrap();
+        let packet = encoder
+            .encode_frame(&[211, 37, 13].repeat(6), 9, gdesk::PixelFormat::Rgb, 1)
+            .unwrap()
+            .unwrap();
+        let mut handler = VideoHandler::new(CodecFormat::GDesk, 0);
+        let mut pixelbuffer = true;
+        assert!(handler
+            .handle_frame(video_frame(packet), &mut pixelbuffer, &mut None)
+            .unwrap());
+        assert!(pixelbuffer);
+        // Flutter's Windows/Linux pixel buffers use RGBA; macOS and legacy use BGRA.
+        let expected = if cfg!(feature = "flutter") && cfg!(any(windows, target_os = "linux")) {
+            [211, 37, 13, 255]
+        } else {
+            [13, 37, 211, 255]
+        };
+        assert_eq!((handler.rgb.w, handler.rgb.h), (3, 2));
+        for row in handler.rgb.raw.chunks_exact(handler.rgb.raw.len() / 2) {
+            assert_eq!(&row[..12], expected.repeat(3));
+        }
+    }
+
     fn video_frame(packet: Vec<u8>) -> VideoFrame {
         let mut frames = EncodedVideoFrames::new();
         frames.frames.push(EncodedVideoFrame {
