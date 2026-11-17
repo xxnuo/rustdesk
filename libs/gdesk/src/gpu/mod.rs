@@ -9,6 +9,7 @@ use std::{
 use wgpu::util::DeviceExt;
 
 pub mod vram;
+pub(crate) mod production;
 pub use wgpu;
 
 const TILE_WORDS: u64 = 3 * 2048;
@@ -149,18 +150,51 @@ pub struct GpuContext {
     pub adapter_name: String,
     pub backend: String,
     pub timestamps: bool,
+    pub device_type: wgpu::DeviceType,
+    failed: Arc<AtomicBool>,
     scan_module: wgpu::ShaderModule,
     module: wgpu::ShaderModule,
 }
 
 impl GpuContext {
     pub fn new() -> Result<Arc<Self>> {
+        Self::request(false)
+    }
+
+    pub fn new_hardware() -> Result<Arc<Self>> {
+        Self::request(true)
+    }
+
+    pub fn is_lost(&self) -> bool {
+        self.failed.load(Ordering::SeqCst)
+    }
+
+    fn request(hardware_only: bool) -> Result<Arc<Self>> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        }))
+        let adapter = if hardware_only {
+            instance
+                .enumerate_adapters(wgpu::Backends::PRIMARY)
+                .into_iter()
+                .filter(|a| {
+                    matches!(
+                        a.get_info().device_type,
+                        wgpu::DeviceType::DiscreteGpu
+                            | wgpu::DeviceType::IntegratedGpu
+                            | wgpu::DeviceType::VirtualGpu
+                    )
+                })
+                .min_by_key(|a| match a.get_info().device_type {
+                    wgpu::DeviceType::DiscreteGpu => 0,
+                    wgpu::DeviceType::IntegratedGpu => 1,
+                    _ => 2,
+                })
+        } else {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            }))
+        }
         .ok_or(Error("no GPU adapter"))?;
         let info = adapter.get_info();
         let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
@@ -183,6 +217,21 @@ impl GpuContext {
             None,
         ))
         .map_err(|_| Error("GPU device request failed"))?;
+        let failed = Arc::new(AtomicBool::new(false));
+        if hardware_only {
+            let lost = failed.clone();
+            device.set_device_lost_callback(move |reason, message| {
+                if !lost.swap(true, Ordering::SeqCst) {
+                    log::warn!("GDesk GPU device lost: {reason:?}: {message}");
+                }
+            });
+            let error = failed.clone();
+            device.on_uncaptured_error(Box::new(move |e| {
+                if !error.swap(true, Ordering::SeqCst) {
+                    log::warn!("GDesk GPU error: {e}");
+                }
+            }));
+        }
         // SAFETY: every index in shaders.wgsl is derived from tile/lane ids bounded by the
         // buffer sizes allocated here; dropping bounds checks and workgroup zero-fill is what
         // keeps the per-tile wavelet passes inside the frame budget.
@@ -210,6 +259,8 @@ impl GpuContext {
             adapter_name: info.name,
             backend: format!("{:?}", info.backend),
             timestamps,
+            device_type: info.device_type,
+            failed,
             scan_module,
             module,
         }))

@@ -17,6 +17,7 @@ use std::{
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GDeskOverlayMetrics {
+    pub active_backend: &'static str,
     pub photon_latency_ms: f64,
     pub encode_us: u32,
     pub decode_us: u32,
@@ -113,6 +114,7 @@ impl GDeskOverlayState {
             jitter[(jitter.len() * 99).div_ceil(100).saturating_sub(1)]
         };
         self.metrics = Some(GDeskOverlayMetrics {
+            active_backend: "Unknown",
             // Half a 240Hz scanout, matching the Phase 5 photon estimate.
             photon_latency_ms: (header.encode_send_delay_us as f64 + decode_us as f64 + 2_083.0)
                 / 1000.0,
@@ -136,6 +138,18 @@ impl GDeskOverlayState {
             measured_at: now,
         });
         Ok(())
+    }
+
+    fn record_backend(&mut self, backend: &str) {
+        if let Some(metrics) = &mut self.metrics {
+            metrics.active_backend = match backend {
+                "GpuVulkan" => "GpuVulkan",
+                "GpuDx12" => "GpuDx12",
+                "GpuMetal" => "GpuMetal",
+                "CpuFallback" => "CpuFallback",
+                _ => "Unknown",
+            };
+        }
     }
 
     fn bandwidth(&self, now: Instant) -> u32 {
@@ -171,6 +185,40 @@ impl std::fmt::Display for GDeskNoOutput {
 impl std::error::Error for GDeskNoOutput {}
 
 impl GDeskEncoderApi {
+    fn recovery_frame(&mut self, ms: i64) -> ResultType<Option<VideoFrame>> {
+        match self.inner.gpu_recovery_pixels()
+            .map_err(|e| anyhow!("gdesk recovery snapshot failed: {e}"))? {
+            Some(pixels) => self.encode_to_message(EncodeInput::YUV(&pixels), ms).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn with_recovery<T>(
+        &mut self,
+        mut encode: impl FnMut(&mut GDeskEncoder) -> gdesk::Result<T>,
+    ) -> gdesk::Result<T> {
+        self.inner.recover_gpu()?;
+        match encode(&mut self.inner) {
+            Err(_) if self.inner.recover_gpu()? => {
+                match encode(&mut self.inner) {
+                    Err(_) if self.inner.gpu_failed() => {
+                        self.inner.fallback_gpu()?;
+                        encode(&mut self.inner)
+                    }
+                    result => result,
+                }
+            }
+            result => result,
+        }
+    }
+
+    pub fn active_backend(&self) -> &'static str {
+        self.inner.active_backend()
+    }
+
+    pub fn gpu_dispatches(&self) -> u64 {
+        self.inner.gpu_dispatches()
+    }
     pub fn enable_udp_datagrams(&mut self, enabled: bool) -> ResultType<()> {
         if enabled != self.datagram_mode {
             self.inner
@@ -192,8 +240,8 @@ impl GDeskEncoderApi {
         pixels: &[u8],
         capture_ts_us: u64,
     ) -> ResultType<Vec<Vec<u8>>> {
-        self.inner
-            .encode_udp_datagrams(pixels, self.width * 4, PixelFormat::Bgra, capture_ts_us)
+        let stride = self.width * 4;
+        self.with_recovery(|inner| inner.encode_udp_datagrams(pixels, stride, PixelFormat::Bgra, capture_ts_us))
             .map_err(|e| anyhow!("gdesk udp encode failed: {e}"))
     }
 
@@ -228,7 +276,7 @@ pub struct GDeskEncoderApi {
     datagram_mode: bool,
 }
 
-fn to_video_frame(bytes: Vec<u8>, ms: i64) -> ResultType<VideoFrame> {
+fn to_video_frame(bytes: Vec<u8>, ms: i64, backend: &str) -> ResultType<VideoFrame> {
     let key = GDeskFrameHeader::from_bytes(&bytes)
         .map_err(|e| anyhow!("bad gdesk frame header: {e}"))?
         .frame_flags
@@ -239,6 +287,7 @@ fn to_video_frame(bytes: Vec<u8>, ms: i64) -> ResultType<VideoFrame> {
         data: bytes.into(),
         key,
         pts: ms,
+        gdesk_active_backend: backend.into(),
         ..Default::default()
     });
     let mut vf = VideoFrame::new();
@@ -246,13 +295,14 @@ fn to_video_frame(bytes: Vec<u8>, ms: i64) -> ResultType<VideoFrame> {
     Ok(vf)
 }
 
-fn datagrams_to_video_frame(datagrams: Vec<Vec<u8>>, ms: i64) -> ResultType<VideoFrame> {
+fn datagrams_to_video_frame(datagrams: Vec<Vec<u8>>, ms: i64, backend: &str) -> ResultType<VideoFrame> {
     let mut frames = EncodedVideoFrames::new();
     for datagram in datagrams {
         frames.frames.push(EncodedVideoFrame {
             data: datagram.into(),
             gdesk_datagram: true,
             pts: ms,
+            gdesk_active_backend: backend.into(),
             ..Default::default()
         });
     }
@@ -268,14 +318,16 @@ impl EncoderApi for GDeskEncoderApi {
         };
         let config = GDeskConfig {
             max_refine_tiles_per_frame: MAX_REFINE_TILES_PER_FRAME,
+            udp_mtu: gdesk::udp::GDESK_UDP_PAYLOAD_MTU,
             ..Default::default()
         };
-        let inner = GDeskEncoder::new(
+        let mut inner = GDeskEncoder::new(
             u16::try_from(cfg.width)?,
             u16::try_from(cfg.height)?,
             config,
         )
         .map_err(|e| anyhow!("create gdesk encoder failed: {e}"))?;
+        inner.enable_gpu();
         Ok(Self {
             inner,
             width: cfg.width,
@@ -291,41 +343,41 @@ impl EncoderApi for GDeskEncoderApi {
             if datagrams.is_empty() {
                 return Err(GDeskNoOutput.into());
             }
-            return datagrams_to_video_frame(datagrams, ms);
+            return datagrams_to_video_frame(datagrams, ms, self.active_backend());
         }
-        match self
-            .inner
-            .encode_frame(
+        let stride = self.width * 4;
+        match self.with_recovery(|inner| inner.encode_frame(
                 pixels,
-                self.width * 4,
+                stride,
                 PixelFormat::Bgra,
                 gdesk::monotonic_us(),
-            )
+            ))
             .map_err(|e| anyhow!("gdesk encode failed: {e}"))?
         {
-            Some(bytes) => to_video_frame(bytes, ms),
+            Some(bytes) => to_video_frame(bytes, ms, self.active_backend()),
             None => Err(GDeskNoOutput.into()),
         }
     }
 
     fn poll_refinement(&mut self, ms: i64) -> ResultType<Option<VideoFrame>> {
+        if let Some(frame) = self.recovery_frame(ms)? {
+            return Ok(Some(frame));
+        }
         if self.datagram_mode {
-            let datagrams = self
-                .inner
-                .poll_refinement_udp_datagrams(gdesk::monotonic_us())
-                .map_err(|e| anyhow!("gdesk datagram refinement failed: {e}"))?;
+            let datagrams = match self.inner.poll_refinement_udp_datagrams(gdesk::monotonic_us()) {
+                Err(_) if self.inner.gpu_failed() => return self.recovery_frame(ms),
+                result => result.map_err(|e| anyhow!("gdesk datagram refinement failed: {e}"))?,
+            };
             return if datagrams.is_empty() {
                 Ok(None)
             } else {
-                datagrams_to_video_frame(datagrams, ms).map(Some)
+                datagrams_to_video_frame(datagrams, ms, self.active_backend()).map(Some)
             };
         }
-        match self
-            .inner
-            .poll_pending_refinement()
+        match self.inner.poll_pending_refinement()
             .map_err(|e| anyhow!("gdesk refinement failed: {e}"))?
         {
-            Some(bytes) => Ok(Some(to_video_frame(bytes, ms)?)),
+            Some(bytes) => Ok(Some(to_video_frame(bytes, ms, self.active_backend())?)),
             None => Ok(None),
         }
     }
@@ -336,6 +388,7 @@ impl EncoderApi for GDeskEncoderApi {
     }
 
     fn has_gdesk_pending_refinement(&self) -> bool {
+        if self.inner.gpu_failed() { return true; }
         if self.datagram_mode {
             self.inner.has_udp_unconfirmed()
         } else {
@@ -392,7 +445,7 @@ impl EncoderApi for GDeskEncoderApi {
     }
 
     fn is_hardware(&self) -> bool {
-        false
+        self.active_backend().starts_with("Gpu")
     }
 
     fn disable(&self) {}
@@ -463,6 +516,7 @@ impl crate::codec::Decoder {
             for frame in &frames.frames {
                 self.gdesk_overlay
                     .record(&frame.data, decode_us, now, &decoder.stats)?;
+                self.gdesk_overlay.record_backend(&frame.gdesk_active_backend);
             }
         }
         Ok(decoded)
@@ -524,6 +578,99 @@ pub fn is_gdesk_frame(frame: &video_frame::Union) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gdesk_production_uses_hardware_and_preserves_wire_pixels() {
+        let mut encoder = GDeskEncoderApi::new(
+            EncoderCfg::GDesk(GDeskEncoderConfig { width: 67, height: 65 }),
+            false,
+        ).unwrap();
+        if !encoder.is_hardware() {
+            assert_eq!(encoder.active_backend(), "CpuFallback");
+        }
+        let pixels: Vec<u8> = (0..67 * 65 * 4)
+            .map(|i| ((i * 173 + i / 7) & 255) as u8).collect();
+        let frame = encoder.encode_to_message(EncodeInput::YUV(&pixels), 1).unwrap();
+        if encoder.is_hardware() { assert!(encoder.gpu_dispatches() > 0); }
+        let mut decoder = GDeskDecoder::new();
+        let mut output = ImageRgb::new(ImageFormat::ARGB, 1);
+        decode_into(&mut decoder, frame.gdesks(), &mut output).unwrap();
+        for (actual, expected) in output.raw.chunks_exact(4).zip(pixels.chunks_exact(4)) {
+            assert_eq!(&actual[..3], &expected[..3]);
+        }
+        assert_eq!(frame.gdesks().frames[0].gdesk_active_backend, encoder.active_backend());
+        for (sent, expected) in [("GpuVulkan", "GpuVulkan"), ("CpuFallback", "CpuFallback"), ("", "Unknown"), ("invalid", "Unknown")] {
+            let mut frame = frame.clone();
+            frame.mut_gdesks().frames[0].gdesk_active_backend = sent.into();
+            let mut decoder = crate::codec::Decoder::new(crate::CodecFormat::GDesk, None);
+            decoder.handle_video_frame(frame.union.as_ref().unwrap(), &mut output,
+                &mut crate::ImageTexture::default(), &mut true, &mut None).unwrap();
+            assert_eq!(decoder.gdesk_overlay_metrics().unwrap().active_backend, expected);
+        }
+    }
+
+    #[test]
+    fn gdesk_preserves_details_outside_prototype_scan() {
+        let mut encoder = GDeskEncoderApi::new(
+            EncoderCfg::GDesk(GDeskEncoderConfig { width: 64, height: 64 }), false,
+        ).unwrap();
+        let mut pixels = [0, 0, 255, 255].repeat(64 * 64);
+        pixels[20 * 4..20 * 4 + 4].copy_from_slice(&[255, 0, 0, 255]);
+        pixels[21 * 4..21 * 4 + 4].copy_from_slice(&[0, 255, 0, 255]);
+        let frame = encoder.encode_to_message(EncodeInput::YUV(&pixels), 1).unwrap();
+        let mut decoder = GDeskDecoder::new();
+        let mut output = ImageRgb::new(ImageFormat::ARGB, 1);
+        decode_into(&mut decoder, frame.gdesks(), &mut output).unwrap();
+        assert_eq!(output.raw, pixels);
+        if encoder.is_hardware() { assert!(encoder.gpu_dispatches() > 0); }
+    }
+
+    #[test]
+    fn gdesk_production_automatically_recovers_active_and_static_frames() {
+        for datagrams in [false, true] {
+            for idle in [false, true] {
+                let mut encoder = GDeskEncoderApi::new(
+                    EncoderCfg::GDesk(GDeskEncoderConfig { width: 64, height: 64 }), false,
+                ).unwrap();
+                encoder.enable_udp_datagrams(datagrams).unwrap();
+                let pixels: Vec<u8> = (0..64 * 64 * 4).map(|i| ((i * 173 + i / 7) & 255) as u8).collect();
+                let first = encoder.encode_to_message(EncodeInput::YUV(&pixels), 1).unwrap();
+                let epoch = GDeskFrameHeader::from_bytes(&first.gdesks().frames[0].data).unwrap().canvas_epoch;
+                let mut decoder = GDeskDecoder::new();
+                let mut output = ImageRgb::new(ImageFormat::ARGB, 1);
+                decode_into(&mut decoder, first.gdesks(), &mut output).unwrap();
+                let Some(device) = encoder.inner.gpu_device() else {
+                    eprintln!("SKIP automatic device-loss test: no hardware GPU");
+                    return;
+                };
+                device.destroy();
+                device.poll(gdesk::gpu::wgpu::Maintain::Wait);
+                let recovered = if idle {
+                    assert!(encoder.has_gdesk_pending_refinement());
+                    encoder.poll_refinement(2).unwrap().unwrap()
+                } else {
+                    encoder.encode_to_message(EncodeInput::YUV(&pixels), 2).unwrap()
+                };
+                let header = GDeskFrameHeader::from_bytes(&recovered.gdesks().frames[0].data).unwrap();
+                assert_eq!(header.canvas_epoch, epoch.wrapping_add(1));
+                decode_into(&mut decoder, recovered.gdesks(), &mut output).unwrap();
+                let mut sequence = header.frame_seq;
+                for tick in 3..500 {
+                    if datagrams { encoder.apply_tile_ack_bitmap(sequence, &decoder.tile_ack_bitmap(sequence)).unwrap(); }
+                    if !encoder.has_gdesk_pending_refinement() { break; }
+                    if let Some(frame) = encoder.poll_refinement(tick).unwrap() {
+                        decode_into(&mut decoder, frame.gdesks(), &mut output).unwrap();
+                        sequence = GDeskFrameHeader::from_bytes(&frame.gdesks().frames[0].data).unwrap().frame_seq;
+                    }
+                }
+                assert!(!encoder.has_gdesk_pending_refinement());
+                for (actual, expected) in output.raw.chunks_exact(4).zip(pixels.chunks_exact(4)) {
+                    assert_eq!(&actual[..3], &expected[..3]);
+                }
+                println!("automatic recovery backend={} datagrams={datagrams} idle={idle} MaxError=0", encoder.active_backend());
+            }
+        }
+    }
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]

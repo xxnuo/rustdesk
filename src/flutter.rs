@@ -740,6 +740,7 @@ impl InvokeUiSession for FlutterHandler {
                 ("gdesk_cache_hit_rate", &status.gdesk_cache_hit_rate.unwrap_or_default()),
                 ("gdesk_qos_light", &status.gdesk_qos_light.unwrap_or_default()),
                 ("gdesk_realtime_bandwidth", &status.gdesk_realtime_bandwidth.unwrap_or_default()),
+                ("gdesk_active_backend", &status.gdesk_active_backend.unwrap_or_default()),
 
             ],
             &[],

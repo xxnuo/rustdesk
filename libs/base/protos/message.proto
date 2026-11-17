@@ -6,6 +6,7 @@ message EncodedVideoFrame {
   bool key = 2;
   int64 pts = 3;
   bool gdesk_datagram = 4;
+  string gdesk_active_backend = 5;
 }
 
 message EncodedVideoFrames { repeated EncodedVideoFrame frames = 1; }

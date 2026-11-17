@@ -25,7 +25,7 @@ mediacodec = ["ndk"]
 linux-pkg-config = ["dep:pkg-config"]
 hwcodec = ["dep:hwcodec"]
 vram = ["hwcodec/vram"]
-gdesk = ["dep:gdesk"]
+gdesk = ["dep:gdesk", "gdesk/gpu"]
 
 [dependencies]
 cfg-if = "1.0"

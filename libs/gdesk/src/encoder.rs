@@ -21,6 +21,7 @@ pub struct GDeskConfig {
     pub udp_redundancy_factor: u8,
     /// UDP mode only: how many times every refinement or retransmission datagram is emitted.
     pub udp_refine_redundancy_factor: u8,
+    pub udp_mtu: usize,
 }
 impl Default for GDeskConfig {
     fn default() -> Self {
@@ -32,13 +33,15 @@ impl Default for GDeskConfig {
             require_confirmed_cache_slots: false,
             udp_redundancy_factor: 1,
             udp_refine_redundancy_factor: 1,
+            udp_mtu: crate::udp::GDESK_UDP_MTU,
         }
     }
 }
 impl GDeskConfig {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.initial_shifts.is_some_and(|(y, c)| y > 15 || c > 15)
             || self.max_refine_tiles_per_frame == 0
+            || !(64..=crate::udp::GDESK_UDP_MTU).contains(&self.udp_mtu)
         {
             return Err(Error("invalid encoder configuration"));
         }
@@ -59,6 +62,8 @@ pub struct GDeskEncoder {
     keep_cache_pending: bool,
     pub(crate) last_capture_ts_us: u64,
     pub udp: crate::udp::UdpEncoderState,
+    #[cfg(feature = "gpu")]
+    pub(crate) gpu: Option<crate::gpu::production::ProductionGpu>,
 }
 impl GDeskEncoder {
     pub fn new(width: u16, height: u16, config: GDeskConfig) -> Result<Self> {
@@ -76,10 +81,155 @@ impl GDeskEncoder {
             keep_cache_pending: false,
             last_capture_ts_us: 0,
             udp: Default::default(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
         })
     }
     pub fn dimensions(&self) -> (u16, u16) {
         (self.width, self.height)
+    }
+    #[cfg(feature = "gpu")]
+    pub fn enable_gpu(&mut self) {
+        self.gpu = match crate::gpu::production::ProductionGpu::new() {
+            Ok(gpu) => {
+                log::info!(
+                    "GDesk active_backend={} adapter={}",
+                    gpu.backend(),
+                    gpu.ctx.adapter_name
+                );
+                Some(gpu)
+            }
+            Err(e) => {
+                log::warn!("GDesk active_backend=CpuFallback: {e}");
+                None
+            }
+        };
+    }
+
+    pub fn active_backend(&self) -> &'static str {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &self.gpu {
+            return gpu.backend();
+        }
+        "CpuFallback"
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn gpu_failed(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|gpu| {
+            gpu.ctx.device.poll(wgpu::Maintain::Poll);
+            gpu.ctx.is_lost()
+        })
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn gpu_device(&self) -> Option<&wgpu::Device> {
+        self.gpu.as_ref().map(|gpu| &gpu.ctx.device)
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn gpu_recovery_pixels(&self) -> Result<Option<Vec<u8>>> {
+        if !self.gpu_failed() || self.states.tiles.iter().any(|s| !s.initialized) {
+            return Ok(None);
+        }
+        let mut pixels = vec![0; self.width as usize * self.height as usize * 4];
+        for (index, state) in self.states.tiles.iter().enumerate() {
+            math::write_tile(
+                &state.last_rgb,
+                &mut pixels,
+                self.width as usize,
+                self.height as usize,
+                self.width as usize * 4,
+                PixelFormat::Bgra,
+                index,
+            )?;
+        }
+        Ok(Some(pixels))
+    }
+
+    pub fn gpu_dispatches(&self) -> u64 {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &self.gpu {
+            return gpu.dispatches;
+        }
+        0
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn recover_gpu(&mut self) -> Result<bool> {
+        if !self.gpu_failed() {
+            return Ok(false);
+        }
+        self.gpu = None;
+        self.reset(self.width, self.height)?;
+        self.enable_gpu();
+        Ok(true)
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn fallback_gpu(&mut self) -> Result<()> {
+        self.gpu = None;
+        self.reset(self.width, self.height)?;
+        log::warn!("GDesk active_backend=CpuFallback after GPU recovery failed");
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn prepare_gpu(
+        &mut self,
+        pixels: &[u8],
+        stride: usize,
+        format: PixelFormat,
+        confirmed_cache: bool,
+    ) -> Result<()> {
+        let Some(gpu) = &mut self.gpu else {
+            return Ok(());
+        };
+        gpu.begin_frame(self.states.tiles.len());
+        let mut tiles = Vec::with_capacity(crate::gpu::production::BATCH_TILES);
+        for (index, state) in self.states.tiles.iter().enumerate() {
+            let tile = math::extract_tile(
+                pixels,
+                self.width as usize,
+                self.height as usize,
+                stride,
+                format,
+                index,
+            )?;
+            if state.initialized && state.last_rgb == tile {
+                continue;
+            }
+            if self
+                .cache
+                .find(math::tile_hash(&tile), &tile, confirmed_cache)
+                .is_some()
+            {
+                continue;
+            }
+            if math::detect_solid(&tile).is_none() && math::detect_two_color(&tile).is_none() {
+                tiles.push((index, tile));
+                if tiles.len() == crate::gpu::production::BATCH_TILES {
+                    gpu.prepare_batch(&tiles)?;
+                    tiles.clear();
+                }
+            }
+        }
+        if !tiles.is_empty() {
+            gpu.prepare_batch(&tiles)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn coefficients(
+        #[cfg(feature = "gpu")] gpu: &mut Option<crate::gpu::production::ProductionGpu>,
+        _index: usize,
+        tile: &[u8],
+    ) -> Result<math::WaveletCoefficients> {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = gpu {
+            return gpu.coefficients(_index, tile);
+        }
+        math::rgb_to_wavelet(tile)
     }
     pub fn reset(&mut self, width: u16, height: u16) -> Result<()> {
         let count = protocol::tile_count(width, height)?;
@@ -131,6 +281,8 @@ impl GDeskEncoder {
             format,
         )?;
         let start = Instant::now();
+        #[cfg(feature = "gpu")]
+        self.prepare_gpu(pixels, stride, format, self.config.require_confirmed_cache_slots)?;
         self.last_capture_ts_us = capture_ts_us;
         let mut records = Vec::new();
         let mut refined = 0;
@@ -203,7 +355,10 @@ impl GDeskEncoder {
                     QoSState::Yellow => (shift_y.max(2), shift_c.max(4)),
                     QoSState::Red => (shift_y.max(4), shift_c.max(6)),
                 };
-                let coeff = math::rgb_to_wavelet(&tile)?;
+                let coeff = Self::coefficients(
+                    #[cfg(feature = "gpu")] &mut self.gpu,
+                    index, &tile,
+                )?;
                 let payload = math::encode_wavelet_init(&coeff, shift_y, shift_c)?;
                 state.sent_shift_y = shift_y;
                 state.sent_shift_c = shift_c;
@@ -316,6 +471,68 @@ impl GDeskEncoder {
 mod tests {
     use super::*;
     use crate::GDeskDecoder;
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn device_loss_rebuilds_epoch_and_refreshes_existing_decoder() {
+        for datagrams in [false, true] {
+            let mut encoder = GDeskEncoder::new(67, 65, GDeskConfig::default()).unwrap();
+            encoder.enable_gpu();
+            let Some(gpu) = &encoder.gpu else {
+                eprintln!("SKIP device_loss: no hardware GPU; this is not GPU acceptance");
+                return;
+            };
+            assert!(matches!(gpu.ctx.device_type,
+                wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::VirtualGpu));
+            println!("C1 adapter={} backend={} device_type={:?}",
+                gpu.ctx.adapter_name, gpu.ctx.backend, gpu.ctx.device_type);
+            let pixels: Vec<u8> = (0..67 * 65 * 3).map(|i| ((i * 173 + i / 7) & 255) as u8).collect();
+            let mut decoder = GDeskDecoder::new();
+            let mut last_seq = 0;
+            let packets = if datagrams {
+                encoder.encode_udp_datagrams(&pixels, 67 * 3, PixelFormat::Rgb, 1).unwrap()
+            } else {
+                vec![encoder.encode_frame(&pixels, 67 * 3, PixelFormat::Rgb, 1).unwrap().unwrap()]
+            };
+            for packet in &packets {
+                if datagrams { decoder.decode_udp_datagram(packet).unwrap(); }
+                else { decoder.decode_frame(packet).unwrap(); }
+            }
+            assert!(encoder.gpu_dispatches() > 0);
+            let epoch = encoder.canvas_epoch();
+            let gpu = encoder.gpu.as_ref().unwrap();
+            gpu.ctx.device.destroy();
+            gpu.ctx.device.poll(wgpu::Maintain::Wait);
+            let recovery_pixels = encoder.gpu_recovery_pixels().unwrap().unwrap();
+            assert!(encoder.recover_gpu().unwrap());
+            assert_eq!(encoder.canvas_epoch(), epoch.wrapping_add(1));
+            println!("C1 device.destroy recovered backend={} epoch={} datagrams={datagrams}",
+                encoder.active_backend(), encoder.canvas_epoch());
+            let packets = if datagrams {
+                encoder.encode_udp_datagrams(&recovery_pixels, 67 * 4, PixelFormat::Bgra, 2).unwrap()
+            } else {
+                vec![encoder.encode_frame(&recovery_pixels, 67 * 4, PixelFormat::Bgra, 2).unwrap().unwrap()]
+            };
+            for packet in packets {
+                last_seq = GDeskFrameHeader::from_bytes(&packet).unwrap().frame_seq;
+                if datagrams { decoder.decode_udp_datagram(&packet).unwrap(); }
+                else { decoder.decode_frame(&packet).unwrap(); }
+            }
+            if datagrams {
+                for now in 3..500 {
+                    encoder.apply_tile_ack_bitmap(last_seq, &decoder.tile_ack_bitmap(last_seq)).unwrap();
+                    if !encoder.has_udp_unconfirmed() { break; }
+                    for packet in encoder.poll_refinement_udp_datagrams(now).unwrap() {
+                        decoder.decode_udp_datagram(&packet).unwrap();
+                        last_seq = GDeskFrameHeader::from_bytes(&packet).unwrap().frame_seq;
+                    }
+                }
+                assert!(!encoder.has_udp_unconfirmed());
+            }
+            assert_eq!(decoder.canvas_rgb(), pixels);
+            assert!(decoder.is_lossless());
+        }
+    }
 
     #[test]
     fn congestion_overrides_initial_shifts_and_green_refines_losslessly() {

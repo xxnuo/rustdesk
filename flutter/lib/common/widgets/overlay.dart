@@ -607,6 +607,8 @@ class QualityMonitor extends StatelessWidget {
                           "Codec", qualityMonitorModel.data.codecFormat ?? '-'),
                       _row("Chroma", qualityMonitorModel.data.chroma ?? '-'),
                       if (qualityMonitorModel.data.codecFormat == 'GDesk') ...[
+                        _row("Backend",
+                            qualityMonitorModel.data.gdeskActiveBackend ?? '-'),
                         _row("Photon (est.)",
                             qualityMonitorModel.data.gdeskPhotonLatency ?? '-'),
                         _row("Enc/Dec",

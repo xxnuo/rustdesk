@@ -9,6 +9,8 @@ use crate::{
 };
 
 pub const GDESK_UDP_MTU: usize = 1200;
+// The production transport adds a 14-byte header and a 16-byte AEAD tag.
+pub const GDESK_UDP_PAYLOAD_MTU: usize = GDESK_UDP_MTU - 30;
 pub const UDP_PACING_WINDOW_US: u64 = 4_000;
 const PACE_MIN_BYTES: usize = 64 * 1024;
 const PACE_MIN_DATAGRAMS: usize = 48;
@@ -24,14 +26,23 @@ pub fn pack_udp_datagrams(
     header: &GDeskFrameHeader,
     records: &[TileRecord],
 ) -> Result<Vec<Vec<u8>>> {
+    pack_udp_datagrams_with_mtu(header, records, GDESK_UDP_MTU)
+}
+
+pub fn pack_udp_datagrams_with_mtu(
+    header: &GDeskFrameHeader,
+    records: &[TileRecord],
+    mtu: usize,
+) -> Result<Vec<Vec<u8>>> {
+    if !(64..=GDESK_UDP_MTU).contains(&mtu) { return Err(Error("invalid udp mtu")); }
     let mut out = Vec::new();
     let mut start = 0;
     while start < records.len() {
         let mut end = start + 1;
-        if datagram_len(header, &records[start..end])? > GDESK_UDP_MTU {
+        if datagram_len(header, &records[start..end])? > mtu {
             return Err(Error("tile record exceeds the udp mtu"));
         }
-        while end < records.len() && datagram_len(header, &records[start..end + 1])? <= GDESK_UDP_MTU
+        while end < records.len() && datagram_len(header, &records[start..end + 1])? <= mtu
         {
             end += 1;
         }
@@ -48,8 +59,8 @@ pub fn unpack_udp_datagram(datagram: &[u8]) -> Result<(GDeskFrameHeader, Vec<Til
     protocol::decode_frame(datagram)
 }
 
-fn record_fits(header: &GDeskFrameHeader, record: &TileRecord) -> bool {
-    datagram_len(header, std::slice::from_ref(record)).is_ok_and(|len| len <= GDESK_UDP_MTU)
+fn record_fits(header: &GDeskFrameHeader, record: &TileRecord, mtu: usize) -> bool {
+    datagram_len(header, std::slice::from_ref(record)).is_ok_and(|len| len <= mtu)
 }
 
 #[derive(Debug, Clone)]
@@ -194,7 +205,10 @@ impl GDeskEncoder {
                 mask,
             }
         } else {
-            let coeff = math::rgb_to_wavelet(&tile)?;
+            let coeff = Self::coefficients(
+                #[cfg(feature = "gpu")] &mut self.gpu,
+                index, &tile,
+            )?;
             let mut chosen = None;
             let floor = self.qos_floor();
             let mut ladder = vec![floor];
@@ -211,7 +225,7 @@ impl GDeskEncoder {
                     shift_c,
                     payload: math::encode_wavelet_init(&coeff, shift_y, shift_c)?,
                 };
-                if record_fits(header, &record) {
+                if record_fits(header, &record, self.config.udp_mtu) {
                     chosen = Some(record);
                     break;
                 }
@@ -277,7 +291,7 @@ impl GDeskEncoder {
                 .collect();
             candidates.sort_by_key(|(y, c)| y + c);
             for new in candidates {
-                if record_fits(header, &make(new, 0, 1)?) {
+                if record_fits(header, &make(new, 0, 1)?, self.config.udp_mtu) {
                     plan = Some((new, 1, 0));
                     break;
                 }
@@ -291,7 +305,7 @@ impl GDeskEncoder {
             };
             'parts: for parts in [2usize, 4, 8] {
                 for part in 0..parts {
-                    if !record_fits(header, &make(new, part, parts)?) {
+                    if !record_fits(header, &make(new, part, parts)?, self.config.udp_mtu) {
                         continue 'parts;
                     }
                 }
@@ -344,7 +358,7 @@ impl GDeskEncoder {
         start: std::time::Instant,
     ) -> Result<Vec<Vec<u8>>> {
         header.encode_send_delay_us = start.elapsed().as_micros().min(u32::MAX as u128) as u32;
-        let unique = pack_udp_datagrams(&header, &records)?;
+        let unique = pack_udp_datagrams_with_mtu(&header, &records, self.config.udp_mtu)?;
         let mut datagrams = Vec::with_capacity(unique.len() * rounds);
         for _ in 0..rounds.max(1) {
             datagrams.extend(unique.iter().cloned());
@@ -362,6 +376,7 @@ impl GDeskEncoder {
         format: PixelFormat,
         capture_ts_us: u64,
     ) -> Result<Vec<Vec<u8>>> {
+        self.config.validate()?;
         math::validate_image(
             pixels,
             self.width as usize,
@@ -370,6 +385,8 @@ impl GDeskEncoder {
             format,
         )?;
         let start = std::time::Instant::now();
+        #[cfg(feature = "gpu")]
+        self.prepare_gpu(pixels, stride, format, true)?;
         let count = self.states.tiles.len();
         if self.udp.ensure(self.canvas_epoch, count) {
             self.cache.confirmed_slots.fill(false);
@@ -414,6 +431,7 @@ impl GDeskEncoder {
 
     /// Resends tiles whose ack timed out or reported a loss, then advances refinement one step.
     pub fn poll_refinement_udp_datagrams(&mut self, capture_ts_us: u64) -> Result<Vec<Vec<u8>>> {
+        self.config.validate()?;
         if self.config.qos_state != QoSState::Green {
             return Ok(Vec::new());
         }
@@ -1133,6 +1151,40 @@ impl InputRedundancyRx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_budget_keeps_initial_and_split_refinement_within_aead_mtu() {
+        let mut encoder = GDeskEncoder::new(64, 64, crate::GDeskConfig {
+            udp_mtu: GDESK_UDP_PAYLOAD_MTU, ..Default::default()
+        }).unwrap();
+        let mut seed = 17u32;
+        let rgb: Vec<u8> = (0..64 * 64 * 3).map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        }).collect();
+        let mut decoder = GDeskDecoder::new();
+        let mut packets = encoder.encode_udp_datagrams(&rgb, 64 * 3, PixelFormat::Rgb, 1).unwrap();
+        let mut last_seq = 0;
+        let mut split = false;
+        for now in 2..500 {
+            for packet in &packets {
+                assert!(packet.len() + 30 <= GDESK_UDP_MTU);
+                let (header, records) = unpack_udp_datagram(packet).unwrap();
+                last_seq = header.frame_seq;
+                split |= records.iter().any(|r| matches!(r,
+                    TileRecord::WaveletRefine { payload, .. } if payload[1] & 15 > 1));
+                decoder.decode_udp_datagram(packet).unwrap();
+            }
+            encoder.apply_tile_ack_bitmap(last_seq, &decoder.tile_ack_bitmap(last_seq)).unwrap();
+            if !encoder.has_udp_unconfirmed() { break; }
+            packets = encoder.poll_refinement_udp_datagrams(now).unwrap();
+        }
+        assert!(split, "fixture must exercise split refinement records");
+        assert!(!encoder.has_udp_unconfirmed());
+        assert_eq!(decoder.canvas_rgb(), rgb);
+    }
 
     #[test]
     fn nic_sort_is_stable_and_demotes_virtual() {

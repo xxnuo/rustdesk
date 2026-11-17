@@ -2895,6 +2895,7 @@ mod gdesk_video_tests {
             assert!(quality.gdesk_p99_jitter.is_some());
             assert!(quality.gdesk_cache_hit_rate.is_some());
             assert!(quality.gdesk_realtime_bandwidth.is_some());
+        assert_eq!(quality.gdesk_active_backend.as_deref(), Some(metrics.active_backend));
             if width == 128 { assert!(metrics.cache_hit_ratio_pct > 0.0); }
         }
         handler.reset(Some(CodecFormat::GDesk));

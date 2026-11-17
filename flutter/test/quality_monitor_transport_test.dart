@@ -28,6 +28,7 @@ void main() {
       'gdesk_cache_hit_rate': '75.0%',
       'gdesk_qos_light': 'Yellow',
       'gdesk_realtime_bandwidth': '800 kbps',
+      'gdesk_active_backend': 'GpuVulkan',
     });
     expect(model.data.gdeskPhotonLatency, '12.50 ms');
     expect(model.data.gdeskCodecUs, '1200/300 us');
@@ -35,12 +36,15 @@ void main() {
     expect(model.data.gdeskCacheHitRate, '75.0%');
     expect(model.data.gdeskQosLight, 'Yellow');
     expect(model.data.gdeskRealtimeBandwidth, '800 kbps');
+    expect(model.data.gdeskActiveBackend, 'GpuVulkan');
     model.updateQualityStatus({'delay': '20', 'gdesk_qos_light': ''});
     expect(model.data.gdeskQosLight, 'Yellow');
+    expect(model.data.gdeskActiveBackend, 'GpuVulkan');
     model.updateQualityStatus({'codec_format': 'VP9'});
     expect(model.data.gdeskPhotonLatency, isNull);
     expect(model.data.gdeskQosLight, isNull);
     expect(model.data.gdeskRealtimeBandwidth, isNull);
+    expect(model.data.gdeskActiveBackend, isNull);
   });
 
   test('the quality monitor names the WebRTC transport only on web', () {

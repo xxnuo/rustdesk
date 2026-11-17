@@ -3903,6 +3903,7 @@ class QualityMonitorData {
   String? gdeskCacheHitRate;
   String? gdeskQosLight;
   String? gdeskRealtimeBandwidth;
+  String? gdeskActiveBackend;
 }
 
 class QualityMonitorModel with ChangeNotifier {
@@ -4001,6 +4002,10 @@ class QualityMonitorModel with ChangeNotifier {
           (evt['gdesk_realtime_bandwidth'] as String).isNotEmpty) {
         _data.gdeskRealtimeBandwidth = evt['gdesk_realtime_bandwidth'];
       }
+      if (evt['gdesk_active_backend'] is String &&
+          (evt['gdesk_active_backend'] as String).isNotEmpty) {
+        _data.gdeskActiveBackend = evt['gdesk_active_backend'];
+      }
       if (_data.codecFormat != 'GDesk') {
         _data.gdeskPhotonLatency = null;
         _data.gdeskCodecUs = null;
@@ -4008,6 +4013,7 @@ class QualityMonitorModel with ChangeNotifier {
         _data.gdeskCacheHitRate = null;
         _data.gdeskQosLight = null;
         _data.gdeskRealtimeBandwidth = null;
+        _data.gdeskActiveBackend = null;
       }
       notifyListeners();
     } catch (e) {

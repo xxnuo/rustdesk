@@ -17,6 +17,7 @@ pub struct QualityStatus {
     pub gdesk_cache_hit_rate: Option<String>,
     pub gdesk_qos_light: Option<String>,
     pub gdesk_realtime_bandwidth: Option<String>,
+    pub gdesk_active_backend: Option<String>,
 }
 
 #[cfg(feature = "gdesk")]
@@ -33,6 +34,7 @@ impl QualityStatus {
         self.gdesk_p99_jitter = Some(format!("{:.2} ms", metrics.frame_p99_jitter_ms));
         self.gdesk_cache_hit_rate = Some(format!("{:.1}%", metrics.cache_hit_ratio_pct));
         self.gdesk_qos_light = Some(metrics.qos_light.to_owned());
+        self.gdesk_active_backend = Some(metrics.active_backend.to_owned());
         self.gdesk_realtime_bandwidth = Some(format!("{} kbps", metrics.current_realtime_kbps()));
     }
 }

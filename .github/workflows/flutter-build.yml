@@ -2519,6 +2519,8 @@ jobs:
             # This runner has no GPU device; CPU gates and the opt-in runtime hooks still run.
             run_drm_tests "gdesk CPU gates" \
               env RUSTC=/opt/gdesk-rust/bin/rustc RUSTDOC=/opt/gdesk-rust/bin/rustdoc /opt/gdesk-rust/bin/cargo test --locked --release -p gdesk --no-default-features
+            run_drm_tests "gdesk GPU recovery" \
+              env RUSTC=/opt/gdesk-rust/bin/rustc RUSTDOC=/opt/gdesk-rust/bin/rustdoc /opt/gdesk-rust/bin/cargo test --locked -p gdesk --lib --features gpu device_loss_rebuilds_epoch_and_refreshes_existing_decoder
             run_drm_tests "scrap gdesk" \
               env RUSTC=/opt/gdesk-rust/bin/rustc RUSTDOC=/opt/gdesk-rust/bin/rustdoc /opt/gdesk-rust/bin/cargo test --locked -p scrap --features gdesk
             run_drm_tests "rustdesk gdesk" \
