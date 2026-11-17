@@ -363,6 +363,10 @@ impl GDeskEncoder {
         for _ in 0..rounds.max(1) {
             datagrams.extend(unique.iter().cloned());
         }
+        let sent_at = header.capture_ts_us.saturating_add(start.elapsed().as_micros().min(u64::MAX as u128) as u64);
+        for record in &records {
+            self.udp.sent_ts_us[record.tile_index() as usize] = sent_at;
+        }
         self.stats.frames += 1;
         self.stats.encoded_bytes += datagrams.iter().map(|d| d.len() as u64).sum::<u64>();
         Ok(datagrams)
@@ -503,6 +507,7 @@ impl GDeskEncoder {
             }
             if bitmap[index / 8] >> (index % 8) & 1 == 1 {
                 self.udp.confirmed[index] = true;
+                self.udp.unsent[index] = false;
                 if self.states.tiles[index].is_lossless() {
                     if let Some((slot, hash)) = self.udp.sent_slot[index] {
                         if self.cache.get(slot).is_some_and(|entry| entry.hash == hash) {
@@ -1153,37 +1158,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn udp_retransmission_clock_starts_after_encoding() {
+        let mut encoder = GDeskEncoder::new(64, 64, crate::GDeskConfig::default()).unwrap();
+        let rgb: Vec<u8> = (0..64 * 64 * 3).map(|i| (i * 37 + i / 17) as u8).collect();
+        let packets = encoder.encode_udp_datagrams(&rgb, 64 * 3, PixelFormat::Rgb, 10).unwrap();
+        let header = GDeskFrameHeader::from_bytes(&packets[0]).unwrap();
+        assert!(header.encode_send_delay_us > 1);
+        encoder.udp.rto_us = 1;
+        let next = encoder.poll_refinement_udp_datagrams(10 + header.encode_send_delay_us as u64).unwrap();
+        for packet in next {
+            let (_, records) = unpack_udp_datagram(&packet).unwrap();
+            assert!(records.iter().all(|r| matches!(r, TileRecord::WaveletRefine { .. })));
+        }
+    }
+
+    #[test]
     fn payload_budget_keeps_initial_and_split_refinement_within_aead_mtu() {
-        let mut encoder = GDeskEncoder::new(64, 64, crate::GDeskConfig {
+        let mut encoder = GDeskEncoder::new(512, 64, crate::GDeskConfig {
             udp_mtu: GDESK_UDP_PAYLOAD_MTU, ..Default::default()
         }).unwrap();
         let mut seed = 17u32;
-        let rgb: Vec<u8> = (0..64 * 64 * 3).map(|_| {
+        let rgb: Vec<u8> = (0..512 * 64 * 3).map(|_| {
             seed ^= seed << 13;
             seed ^= seed >> 17;
             seed ^= seed << 5;
             seed as u8
         }).collect();
         let mut decoder = GDeskDecoder::new();
-        let mut packets = encoder.encode_udp_datagrams(&rgb, 64 * 3, PixelFormat::Rgb, 1).unwrap();
-        let mut last_seq = 0;
+        let mut packets = encoder.encode_udp_datagrams(&rgb, 512 * 3, PixelFormat::Rgb, 1).unwrap();
         let mut split = false;
+        assert!(packets.len() > 1);
         for now in 2..500 {
             for packet in &packets {
                 assert!(packet.len() + 30 <= GDESK_UDP_MTU);
                 let (header, records) = unpack_udp_datagram(packet).unwrap();
-                last_seq = header.frame_seq;
+                let last_seq = header.frame_seq;
                 split |= records.iter().any(|r| matches!(r,
                     TileRecord::WaveletRefine { payload, .. } if payload[1] & 15 > 1));
                 decoder.decode_udp_datagram(packet).unwrap();
+                encoder.apply_tile_ack_bitmap(last_seq, &decoder.tile_ack_bitmap(last_seq)).unwrap();
             }
-            encoder.apply_tile_ack_bitmap(last_seq, &decoder.tile_ack_bitmap(last_seq)).unwrap();
+            if now == 2 {
+                assert!(encoder.encode_udp_datagrams(&rgb, 512 * 3, PixelFormat::Rgb, now).unwrap().is_empty());
+            }
             if !encoder.has_udp_unconfirmed() { break; }
             packets = encoder.poll_refinement_udp_datagrams(now).unwrap();
         }
         assert!(split, "fixture must exercise split refinement records");
         assert!(!encoder.has_udp_unconfirmed());
         assert_eq!(decoder.canvas_rgb(), rgb);
+        assert!(encoder.poll_refinement_udp_datagrams(501).unwrap().is_empty());
     }
 
     #[test]
